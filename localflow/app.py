@@ -53,7 +53,10 @@ DEFAULT_CONFIG = {
     "key_mode": "toggle",  # "toggle": tap to start/stop; "hold": push-to-talk
     "toggle_hotkey": "<ctrl>+<alt>+<space>",
     "language": "auto",
-    "cleanup": True,
+    # LLM cleanup off by default: qwen resident + parakeet resident thrashes
+    # 8 GB unified memory (measured: 1s -> 106s STT). Python post-processing
+    # (fillers, dictionary names) covers the common cases for free.
+    "cleanup": False,
     "ollama_model": "qwen2.5:3b",
     "ollama_url": "http://127.0.0.1:11434",
     "stt_engine": "parakeet",  # "parakeet" (fast) or "whisper" (dict-prompt)
@@ -95,6 +98,32 @@ LANG_MARKERS = {
     "en": {"and", "the", "not", "with", "for", "that", "but", "also", "to",
            "of", "it", "we", "you", "please", "tomorrow", "have", "will"},
 }
+
+
+# Standalone filler tokens that are safe to strip in any of the three
+# languages. Deliberately NOT "um"/"im"/"eh" — real words in DE/NL.
+FILLERS = {"ähm", "äh", "ehm", "uhm", "uh", "hmm", "mhm", "ähm.", "ähm,"}
+
+
+def post_process(text, dictionary_words):
+    """Free, instant cleanup: strip fillers, fix proper nouns via fuzzy
+    match against dictionary.txt. Replaces the LLM pass by default."""
+    import difflib
+    names = [w.strip() for w in dictionary_words.split(",") if w.strip()]
+    out = []
+    for raw in text.split():
+        core = raw.strip(".,!?;:")
+        if core.lower() in FILLERS or core.lower().strip(".,") in FILLERS:
+            continue
+        if names and core and core[0].isupper() and core not in names:
+            match = difflib.get_close_matches(core, names, n=1, cutoff=0.8)
+            if match:
+                raw = raw.replace(core, match[0])
+        out.append(raw)
+    cleaned = " ".join(out)
+    # A stripped leading filler can leave ", rest..." behind.
+    cleaned = cleaned.lstrip(",. ")
+    return cleaned[:1].upper() + cleaned[1:] if cleaned else text
 
 
 def detect_lang(text):
@@ -335,7 +364,9 @@ def ollama_cleanup(cfg, text, lang=""):
             json={
                 "model": cfg["ollama_model"],
                 "stream": False,
-                "keep_alive": "30m",
+                # Short keep_alive: a resident 3b model starves parakeet
+                # on 8 GB. Each LLM cleanup pays the load cost instead.
+                "keep_alive": "2m",
                 "options": {"temperature": 0.1},
                 "messages": [
                     {"role": "system",
@@ -693,6 +724,7 @@ class LocalFlowApp(rumps.App):
                 lang = self.cfg["language"]
             elif not lang:
                 lang = detect_lang(text)
+            text = post_process(text, load_dictionary())
             # Very short dictations carry no fillers; skip the LLM pass.
             if self.cfg["cleanup"] and len(text.split()) >= self.cfg.get(
                     "cleanup_min_words", 6):
