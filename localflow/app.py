@@ -31,6 +31,18 @@ from AppKit import (NSBackingStoreBuffered, NSColor, NSFont, NSImage,
                     NSWindowStyleMaskNonactivatingPanel)
 from PyObjCTools import AppHelper
 
+# GUI-launched apps miss the Homebrew PATH; parakeet needs ffmpeg from there.
+os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
+
+# GUI-launched apps also run with an ASCII locale, which makes every
+# open() without encoding= (e.g. parakeet reading its config) crash on
+# non-ASCII bytes. Force UTF-8 for the whole process.
+import locale  # noqa: E402
+try:
+    locale.setlocale(locale.LC_CTYPE, "en_US.UTF-8")
+except locale.Error:
+    pass
+
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "config.json"
 DICT_PATH = ROOT / "dictionary.txt"
@@ -194,7 +206,16 @@ class ParakeetEngine:
     def _worker(self):
         try:
             from parakeet_mlx import from_pretrained
-            self.model = from_pretrained(self.cfg["parakeet_model"])
+            # Resolve the cached snapshot offline: from_pretrained's own hub
+            # call fails in GUI-launched contexts and then misreads the repo
+            # id as a local directory.
+            try:
+                from huggingface_hub import snapshot_download
+                model_ref = snapshot_download(self.cfg["parakeet_model"],
+                                              local_files_only=True)
+            except Exception:
+                model_ref = self.cfg["parakeet_model"]  # first run: download
+            self.model = from_pretrained(model_ref)
             # First inference compiles the graph (~5s); absorb it at boot
             # with a short silent clip so the first real dictation is fast.
             warm = "/tmp/localflow_warmup.wav"
@@ -560,7 +581,12 @@ class LocalFlowApp(rumps.App):
 
         key_mode = self.cfg.get("key_mode", "toggle")
 
+        first_event = [True]
+
         def on_press(key):
+            if first_event[0]:
+                first_event[0] = False
+                log("key events flowing (input monitoring OK)")
             pressed.add(key)
             if key == hold_key:
                 if key_mode == "toggle":
@@ -583,6 +609,7 @@ class LocalFlowApp(rumps.App):
 
         listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         listener.start()
+        log(f"hotkey listener started (mode={key_mode})")
         listener.join()
 
     # ---- record / transcribe / paste ----
