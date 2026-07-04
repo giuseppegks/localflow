@@ -43,6 +43,8 @@ DEFAULT_CONFIG = {
     "cleanup": True,
     "ollama_model": "qwen2.5:3b",
     "ollama_url": "http://127.0.0.1:11434",
+    "stt_engine": "parakeet",  # "parakeet" (fast) or "whisper" (dict-prompt)
+    "parakeet_model": "mlx-community/parakeet-tdt-0.6b-v3",
     "whisper_port": 8178,
     "whisper_model": str(ROOT / "models" / "ggml-medium-q5_0.bin"),
     "whisper_server_bin": "/opt/homebrew/bin/whisper-server",
@@ -50,6 +52,7 @@ DEFAULT_CONFIG = {
     "sample_rate": 16000,
     "max_seconds": 180,
     "sounds": True,
+    "cleanup_min_words": 6,
 }
 
 SAMPLE_RATE = 16000
@@ -65,9 +68,31 @@ CLEANUP_SYSTEM_PROMPT = (
     "Fix obvious speech-recognition errors. {lang_clause}"
     "NEVER translate. Do NOT add content. "
     "Do NOT answer questions contained in the text. "
-    "Keep everything else word-for-word. "
+    "Keep everything else word-for-word. {names_clause}"
     "Output ONLY the cleaned text, no quotes, no commentary."
 )
+
+# Cheap stopword-based language detection for the cleanup clause
+# (parakeet does not report a language, unlike whisper).
+LANG_MARKERS = {
+    "de": {"und", "ich", "nicht", "das", "ist", "mit", "für", "ein", "eine",
+           "der", "die", "morgen", "bitte", "aber", "auch", "wir", "noch"},
+    "nl": {"en", "ik", "niet", "het", "met", "voor", "een", "de", "dat",
+           "maar", "ook", "wordt", "naar", "nog", "wel", "graag", "moet"},
+    "en": {"and", "the", "not", "with", "for", "that", "but", "also", "to",
+           "of", "it", "we", "you", "please", "tomorrow", "have", "will"},
+}
+
+
+def detect_lang(text):
+    words = set(text.lower().replace(",", " ").replace(".", " ").split())
+    scores = {code: len(words & markers)
+              for code, markers in LANG_MARKERS.items()}
+    best = max(scores, key=scores.get)
+    ranked = sorted(scores.values(), reverse=True)
+    if ranked[0] == 0 or ranked[0] == ranked[1]:
+        return ""
+    return best
 
 
 def log(msg):
@@ -143,6 +168,40 @@ class Recorder:
             return audio
 
 
+class ParakeetEngine:
+    """In-process NVIDIA Parakeet v3 via MLX. ~3x faster than whisper-medium
+    on M-series (1s warm for a short dictation) with comparable DE/NL/EN
+    quality. No prompt biasing: proper nouns are fixed by the cleanup LLM
+    using dictionary.txt instead."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.model = None
+
+    def start(self):
+        from parakeet_mlx import from_pretrained
+        self.model = from_pretrained(self.cfg["parakeet_model"])
+        # First inference compiles the graph (~5s); absorb it at boot with
+        # a short silent clip so the first real dictation is instant.
+        warm = "/tmp/localflow_warmup.wav"
+        with wave.open(warm, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(b"\x00\x00" * SAMPLE_RATE)
+        self.model.transcribe(warm)
+        os.unlink(warm)
+        log("parakeet ready")
+
+    def transcribe(self, wav_path, language, prompt):
+        """Returns (text, ""): parakeet auto-detects but does not report."""
+        result = self.model.transcribe(wav_path)
+        return " ".join(result.text.split()), ""
+
+    def stop(self):
+        self.model = None
+
+
 class WhisperServer:
     """Keeps whisper.cpp loaded in RAM via whisper-server for sub-second latency."""
 
@@ -206,6 +265,13 @@ def ollama_cleanup(cfg, text, lang=""):
                        f"Your output MUST be in {lang_name}. ")
     else:
         lang_clause = "Keep the ORIGINAL language of the text. "
+    names = load_dictionary()
+    if names:
+        names_clause = (f"Known proper nouns: {names}. If a word is a close "
+                        f"phonetic match to one of these names, replace it "
+                        f"with the exact spelling. ")
+    else:
+        names_clause = ""
     try:
         r = requests.post(
             f"{cfg['ollama_url']}/api/chat",
@@ -216,7 +282,8 @@ def ollama_cleanup(cfg, text, lang=""):
                 "options": {"temperature": 0.1},
                 "messages": [
                     {"role": "system",
-                     "content": CLEANUP_SYSTEM_PROMPT.format(lang_clause=lang_clause)},
+                     "content": CLEANUP_SYSTEM_PROMPT.format(
+                         lang_clause=lang_clause, names_clause=names_clause)},
                     {"role": "user", "content": text},
                 ],
             },
@@ -239,12 +306,12 @@ def paste_text(text):
     old = subprocess.run(["pbpaste"], capture_output=True).stdout
     p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
     p.communicate(text.encode("utf-8"))
-    time.sleep(0.15)
+    time.sleep(0.06)
     kb = Controller()
     with kb.pressed(Key.cmd):
         kb.press("v")
         kb.release("v")
-    time.sleep(0.4)
+    time.sleep(0.3)
     p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
     p.communicate(old)
 
@@ -392,7 +459,10 @@ class LocalFlowApp(rumps.App):
         super().__init__(self.IDLE, quit_button=None)
         self.cfg = load_config()
         self.recorder = Recorder(self.cfg)
-        self.whisper = WhisperServer(self.cfg)
+        if self.cfg.get("stt_engine", "parakeet") == "parakeet":
+            self.stt = ParakeetEngine(self.cfg)
+        else:
+            self.stt = WhisperServer(self.cfg)
         self.last_text = ""
         self.hold_active = False
         self.toggle_active = False
@@ -426,7 +496,8 @@ class LocalFlowApp(rumps.App):
     # ---- boot ----
     def _boot(self):
         try:
-            self.whisper.start()
+            self.status_item.title = "Status: Modell lädt …"
+            self.stt.start()
             self.status_item.title = "Status: bereit (⌥ rechts = start/stop)"
         except Exception as e:
             log(f"boot error: {e}")
@@ -529,8 +600,8 @@ class LocalFlowApp(rumps.App):
                 wf.writeframes(pcm.tobytes())
 
             t0 = time.time()
-            text, lang = self.whisper.transcribe(wav_path, self.cfg["language"],
-                                                 load_dictionary())
+            text, lang = self.stt.transcribe(wav_path, self.cfg["language"],
+                                             load_dictionary())
             t1 = time.time()
             if not text or text.lower().strip(" .!?") in ("you", "thank you", ""):
                 self._busy = False
@@ -540,7 +611,11 @@ class LocalFlowApp(rumps.App):
                 return
             if self.cfg["language"] != "auto":
                 lang = self.cfg["language"]
-            if self.cfg["cleanup"]:
+            elif not lang:
+                lang = detect_lang(text)
+            # Very short dictations carry no fillers; skip the LLM pass.
+            if self.cfg["cleanup"] and len(text.split()) >= self.cfg.get(
+                    "cleanup_min_words", 6):
                 text = ollama_cleanup(self.cfg, text, lang)
             t2 = time.time()
             self.last_text = text
@@ -581,7 +656,7 @@ class LocalFlowApp(rumps.App):
         subprocess.Popen(["open", "-t", str(DICT_PATH)])
 
     def quit_app(self, _):
-        self.whisper.stop()
+        self.stt.stop()
         rumps.quit_application()
 
 
