@@ -37,6 +37,7 @@ LOG_PATH = ROOT / "localflow.log"
 
 DEFAULT_CONFIG = {
     "hold_key": "alt_r",
+    "key_mode": "toggle",  # "toggle": tap to start/stop; "hold": push-to-talk
     "toggle_hotkey": "<ctrl>+<alt>+<space>",
     "language": "auto",
     "cleanup": True,
@@ -426,7 +427,7 @@ class LocalFlowApp(rumps.App):
     def _boot(self):
         try:
             self.whisper.start()
-            self.status_item.title = "Status: bereit (⌥ rechts halten / ⌃⌥Space)"
+            self.status_item.title = "Status: bereit (⌥ rechts = start/stop)"
         except Exception as e:
             log(f"boot error: {e}")
             self.status_item.title = f"Status: FEHLER – {e}"
@@ -448,10 +449,15 @@ class LocalFlowApp(rumps.App):
                 self.toggle_active = True
                 self.start_recording()
 
+        key_mode = self.cfg.get("key_mode", "toggle")
+
         def on_press(key):
             pressed.add(key)
-            if key == hold_key and not self.toggle_active and not self._busy:
-                if not self.hold_active:
+            if key == hold_key:
+                if key_mode == "toggle":
+                    on_toggle()
+                elif not self.toggle_active and not self._busy \
+                        and not self.hold_active:
                     self.hold_active = True
                     self.start_recording()
             elif key == Key.space:
@@ -462,7 +468,7 @@ class LocalFlowApp(rumps.App):
 
         def on_release(key):
             pressed.discard(key)
-            if key == hold_key and self.hold_active:
+            if key_mode == "hold" and key == hold_key and self.hold_active:
                 self.hold_active = False
                 self.finish_recording()
 
