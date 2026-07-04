@@ -690,6 +690,11 @@ class LocalFlowApp(rumps.App):
             history = history[1:] + [min(1.0, self.recorder.level * 14)]
             self.hud.set_levels(history)
             time.sleep(0.06)
+        # Recording can end without user action (max_seconds hit in the
+        # audio callback). Finish the dictation instead of freezing the HUD.
+        if self.toggle_active and not self._busy:
+            self.toggle_active = False
+            self.finish_recording()
 
     def _busy_ticker(self):
         """Gentle uniform pulse while transcribing/formatting."""
