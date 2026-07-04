@@ -1,0 +1,19 @@
+{
+  "hold_key": "alt_r",
+  "toggle_hotkey": "<ctrl>+<alt>+<space>",
+  "language": "auto",
+  "cleanup": true,
+  "ollama_model": "qwen2.5:3b",
+  "ollama_url": "http://127.0.0.1:11434",
+  "whisper_port": 8178,
+  "whisper_model": "/Users/giuseppegeukes/repos/localflow/models/ggml-medium-q5_0.bin",
+  "whisper_server_bin": "/opt/homebrew/bin/whisper-server",
+  "whisper_flags": [
+    "-bs",
+    "1",
+    "-fa"
+  ],
+  "sample_rate": 16000,
+  "max_seconds": 180,
+  "sounds": true
+}

@@ -1,0 +1,21 @@
+# Ein Wort/Name pro Zeile. Wird Whisper als Kontext mitgegeben,
+# damit Eigennamen richtig erkannt werden.
+Giu
+Giuseppe
+Geukes
+Mirason
+Mirathera
+Gegen Migräne
+ViewInside
+Sonsbeck
+Nijmegen
+Louisendorf
+Kleve
+UStVA
+ELSTER
+Shopify
+Obsidian
+Claude
+Anthropic
+Hetzner
+Syncthing
