@@ -9,6 +9,7 @@ Nothing leaves the machine.
 import json
 import math
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -177,33 +178,63 @@ class ParakeetEngine:
     def __init__(self, cfg):
         self.cfg = cfg
         self.model = None
+        self.jobs = queue.Queue()
+        self.ready = threading.Event()
+        self.error = None
 
     def start(self):
-        from parakeet_mlx import from_pretrained
-        self.model = from_pretrained(self.cfg["parakeet_model"])
-        # First inference compiles the graph (~5s); absorb it at boot with
-        # a short silent clip so the first real dictation is instant.
-        warm = "/tmp/localflow_warmup.wav"
-        with wave.open(warm, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(b"\x00\x00" * SAMPLE_RATE)
-        self.model.transcribe(warm)
-        os.unlink(warm)
+        # MLX streams are bound to the thread that created them: loading
+        # and transcribing MUST happen on the same dedicated worker thread,
+        # otherwise "There is no Stream(gpu, 0) in current thread".
+        threading.Thread(target=self._worker, daemon=True).start()
+        self.ready.wait()
+        if self.error:
+            raise RuntimeError(self.error)
+
+    def _worker(self):
+        try:
+            from parakeet_mlx import from_pretrained
+            self.model = from_pretrained(self.cfg["parakeet_model"])
+            # First inference compiles the graph (~5s); absorb it at boot
+            # with a short silent clip so the first real dictation is fast.
+            warm = "/tmp/localflow_warmup.wav"
+            with wave.open(warm, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(b"\x00\x00" * SAMPLE_RATE)
+            self.model.transcribe(warm)
+            os.unlink(warm)
+        except Exception as e:
+            self.error = str(e)
+            self.ready.set()
+            return
+        self.ready.set()
         log("parakeet ready")
+        while True:
+            wav_path, out = self.jobs.get()
+            if wav_path is None:
+                return
+            try:
+                # chunk_duration bounds the attention window: without it,
+                # long recordings blow up memory on 8 GB and never return.
+                r = self.model.transcribe(wav_path, chunk_duration=60.0,
+                                          overlap_duration=10.0)
+                out.put((" ".join(r.text.split()), None))
+            except Exception as e:
+                out.put((None, e))
 
     def transcribe(self, wav_path, language, prompt):
-        """Returns (text, ""): parakeet auto-detects but does not report.
-
-        chunk_duration bounds the attention window: without it, long
-        recordings blow up memory on 8 GB and the call never returns.
-        """
-        result = self.model.transcribe(wav_path, chunk_duration=60.0,
-                                       overlap_duration=10.0)
-        return " ".join(result.text.split()), ""
+        """Returns (text, ""): parakeet auto-detects but does not report."""
+        out = queue.Queue()
+        self.jobs.put((wav_path, out))
+        text, err = out.get()
+        if err:
+            raise err
+        return text, ""
 
     def stop(self):
+        self.jobs.put((None, None))
         self.model = None
 
 
