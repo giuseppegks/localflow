@@ -7,6 +7,7 @@ Nothing leaves the machine.
 """
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -23,8 +24,9 @@ from pynput import keyboard
 from pynput.keyboard import Controller, Key
 
 import Foundation
-from AppKit import (NSBackingStoreBuffered, NSColor, NSFont, NSPanel,
-                    NSScreen, NSTextField, NSWindowStyleMaskBorderless,
+from AppKit import (NSBackingStoreBuffered, NSColor, NSFont, NSImage,
+                    NSImageView, NSPanel, NSScreen, NSTextField, NSView,
+                    NSWindowStyleMaskBorderless,
                     NSWindowStyleMaskNonactivatingPanel)
 from PyObjCTools import AppHelper
 
@@ -51,12 +53,16 @@ DEFAULT_CONFIG = {
 
 SAMPLE_RATE = 16000
 
+LANG_NAMES = {"de": "German", "german": "German",
+              "nl": "Dutch", "dutch": "Dutch",
+              "en": "English", "english": "English"}
+
 CLEANUP_SYSTEM_PROMPT = (
     "You clean up dictated text. Fix punctuation and capitalization. "
     "Remove filler words (um, uh, äh, ähm, ehm, im as filler, nou ja, "
     "dus as filler, like as filler). "
-    "Fix obvious speech-recognition errors. Keep the ORIGINAL language "
-    "(German, Dutch, or English). Do NOT translate. Do NOT add content. "
+    "Fix obvious speech-recognition errors. {lang_clause}"
+    "NEVER translate. Do NOT add content. "
     "Do NOT answer questions contained in the text. "
     "Keep everything else word-for-word. "
     "Output ONLY the cleaned text, no quotes, no commentary."
@@ -99,6 +105,7 @@ class Recorder:
         self.frames = []
         self.stream = None
         self.recording = False
+        self.level = 0.0
         self._lock = threading.Lock()
 
     def start(self):
@@ -115,6 +122,7 @@ class Recorder:
 
     def _callback(self, indata, frame_count, time_info, status):
         self.frames.append(indata.copy())
+        self.level = float(np.sqrt(np.mean(indata ** 2)))
         if len(self.frames) * frame_count / SAMPLE_RATE > self.cfg["max_seconds"]:
             self.recording = False
             raise sd.CallbackStop()
@@ -167,7 +175,8 @@ class WhisperServer:
             return False
 
     def transcribe(self, wav_path, language, prompt):
-        data = {"response_format": "json", "temperature": "0.0"}
+        """Returns (text, detected_language_code)."""
+        data = {"response_format": "verbose_json", "temperature": "0.0"}
         if language and language != "auto":
             data["language"] = language
         else:
@@ -177,7 +186,10 @@ class WhisperServer:
         with open(wav_path, "rb") as f:
             r = requests.post(self.url, files={"file": f}, data=data, timeout=120)
         r.raise_for_status()
-        return " ".join(r.json().get("text", "").split())
+        j = r.json()
+        text = " ".join(j.get("text", "").split())
+        lang = (j.get("language") or "").strip().lower()
+        return text, lang
 
     def stop(self):
         if self.proc:
@@ -185,8 +197,14 @@ class WhisperServer:
             self.proc = None
 
 
-def ollama_cleanup(cfg, text):
+def ollama_cleanup(cfg, text, lang=""):
     """Local LLM pass: filler removal, punctuation, formatting. Falls back to raw text."""
+    lang_name = LANG_NAMES.get(lang, lang)
+    if lang_name:
+        lang_clause = (f"The dictated text is in {lang_name}. "
+                       f"Your output MUST be in {lang_name}. ")
+    else:
+        lang_clause = "Keep the ORIGINAL language of the text. "
     try:
         r = requests.post(
             f"{cfg['ollama_url']}/api/chat",
@@ -196,7 +214,8 @@ def ollama_cleanup(cfg, text):
                 "keep_alive": "30m",
                 "options": {"temperature": 0.1},
                 "messages": [
-                    {"role": "system", "content": CLEANUP_SYSTEM_PROMPT},
+                    {"role": "system",
+                     "content": CLEANUP_SYSTEM_PROMPT.format(lang_clause=lang_clause)},
                     {"role": "user", "content": text},
                 ],
             },
@@ -230,14 +249,17 @@ def paste_text(text):
 
 
 class HUD:
-    """Floating status pill at the bottom of the screen (VoiceInk-style).
-
-    Shows recording/processing/done states so the user always sees what
-    LocalFlow is doing. Non-activating: focus stays in the target app.
+    """Floating pill at the bottom of the screen, styled after VoiceInk:
+    black capsule, gray seal badge left, live waveform bars center,
+    gold sparkles right. Non-activating: focus stays in the target app.
     All UI mutations are marshalled onto the main thread via callAfter.
     """
 
-    W, H = 260, 44
+    W, H = 232, 52
+    NBARS = 14
+    BAR_W = 4.0
+    BAR_MIN = 5.0
+    BAR_MAX = 24.0
 
     def __init__(self):
         rect = Foundation.NSMakeRect(0, 0, self.W, self.H)
@@ -254,44 +276,110 @@ class HUD:
         content = self.panel.contentView()
         content.setWantsLayer_(True)
         content.layer().setBackgroundColor_(
-            NSColor.colorWithCalibratedWhite_alpha_(0.08, 0.92).CGColor())
+            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.96).CGColor())
         content.layer().setCornerRadius_(self.H / 2.0)
+
+        def symbol(name, tint, x, size=22):
+            iv = NSImageView.alloc().initWithFrame_(
+                Foundation.NSMakeRect(x, (self.H - size) / 2.0, size, size))
+            img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                name, None)
+            iv.setImage_(img)
+            iv.setContentTintColor_(tint)
+            content.addSubview_(iv)
+            return iv
+
+        self.badge = symbol("checkmark.seal.fill",
+                            NSColor.systemGrayColor(), 16)
+        self.sparkle = symbol("sparkles",
+                              NSColor.systemYellowColor(), self.W - 38)
+
+        # Waveform bars: tiny layer-backed views, heights follow mic level.
+        area_x0, area_x1 = 52.0, self.W - 52.0
+        step = (area_x1 - area_x0 - self.BAR_W) / (self.NBARS - 1)
+        self.bars = []
+        for i in range(self.NBARS):
+            bar = NSView.alloc().initWithFrame_(Foundation.NSMakeRect(
+                area_x0 + i * step, (self.H - self.BAR_MIN) / 2.0,
+                self.BAR_W, self.BAR_MIN))
+            bar.setWantsLayer_(True)
+            bar.layer().setBackgroundColor_(
+                NSColor.colorWithCalibratedWhite_alpha_(0.9, 0.95).CGColor())
+            bar.layer().setCornerRadius_(self.BAR_W / 2.0)
+            content.addSubview_(bar)
+            self.bars.append(bar)
+
+        # Error label, hidden unless something goes wrong.
         self.label = NSTextField.alloc().initWithFrame_(
-            Foundation.NSMakeRect(10, (self.H - 20) / 2.0 - 1, self.W - 20, 20))
+            Foundation.NSMakeRect(46, (self.H - 16) / 2.0 - 1,
+                                  self.W - 92, 16))
         self.label.setBezeled_(False)
         self.label.setDrawsBackground_(False)
         self.label.setEditable_(False)
         self.label.setSelectable_(False)
         self.label.setAlignment_(2)  # NSTextAlignmentCenter (macOS)
-        self.label.setFont_(NSFont.systemFontOfSize_weight_(14, 0.3))
+        self.label.setFont_(NSFont.systemFontOfSize_weight_(12, 0.3))
         self.label.setTextColor_(NSColor.whiteColor())
+        self.label.setHidden_(True)
         content.addSubview_(self.label)
+
         screen = NSScreen.mainScreen().frame()
         self.panel.setFrameOrigin_(
             Foundation.NSMakePoint((screen.size.width - self.W) / 2.0, 140))
         self._gen = 0
 
-    def _apply(self, text):
-        self.label.setStringValue_(text)
+    # -- main-thread appliers --
+    def _apply_levels(self, levels):
+        self.label.setHidden_(True)
+        for bar, v in zip(self.bars, levels):
+            h = self.BAR_MIN + (self.BAR_MAX - self.BAR_MIN) * max(0.0, min(1.0, v))
+            f = bar.frame()
+            bar.setFrame_(Foundation.NSMakeRect(
+                f.origin.x, (self.H - h) / 2.0, self.BAR_W, h))
+            bar.setHidden_(False)
         self.panel.orderFrontRegardless()
 
-    def show(self, text):
-        self._gen += 1
-        AppHelper.callAfter(self._apply, text)
+    def _apply_msg(self, text):
+        for bar in self.bars:
+            bar.setHidden_(True)
+        self.label.setStringValue_(text)
+        self.label.setHidden_(False)
+        self.panel.orderFrontRegardless()
 
-    def flash(self, text, seconds=1.4):
+    def _apply_badge(self, color):
+        self.badge.setContentTintColor_(color)
+
+    # -- thread-safe API --
+    def set_levels(self, levels):
+        levels = (list(levels) + [0.0] * self.NBARS)[:self.NBARS]
+        self._gen += 1
+        AppHelper.callAfter(self._apply_levels, levels)
+
+    def flash_ok(self, seconds=1.0):
         self._gen += 1
         gen = self._gen
-        AppHelper.callAfter(self._apply, text)
+        AppHelper.callAfter(self._apply_badge, NSColor.systemGreenColor())
+        AppHelper.callAfter(self._apply_levels, [0.15] * self.NBARS)
+        threading.Timer(seconds, lambda: self._hide_if(gen)).start()
+
+    def flash_msg(self, text, seconds=1.4):
+        self._gen += 1
+        gen = self._gen
+        AppHelper.callAfter(self._apply_msg, text)
         threading.Timer(seconds, lambda: self._hide_if(gen)).start()
 
     def _hide_if(self, gen):
         if gen == self._gen:
-            AppHelper.callAfter(self.panel.orderOut_, None)
+            AppHelper.callAfter(self._reset_and_hide)
+
+    def _reset_and_hide(self):
+        self.badge.setContentTintColor_(NSColor.systemGrayColor())
+        self.label.setHidden_(True)
+        self.panel.orderOut_(None)
 
     def hide(self):
         self._gen += 1
-        AppHelper.callAfter(self.panel.orderOut_, None)
+        AppHelper.callAfter(self._reset_and_hide)
 
 
 class LocalFlowApp(rumps.App):
@@ -392,26 +480,36 @@ class LocalFlowApp(rumps.App):
                 threading.Thread(target=self._rec_ticker, daemon=True).start()
         except Exception as e:
             log(f"record start error: {e}")
-            self.hud.flash("✕ Mikrofon-Fehler")
+            self.hud.flash_msg("Mikrofon-Fehler")
             self.title = self.IDLE
 
     def _rec_ticker(self):
-        t0 = time.time()
+        """Scrolling live waveform while recording."""
+        history = [0.0] * HUD.NBARS
         while self.recorder.recording:
-            self.hud.show(f"🔴 Aufnahme · {int(time.time() - t0)}s")
-            time.sleep(0.5)
+            history = history[1:] + [min(1.0, self.recorder.level * 14)]
+            self.hud.set_levels(history)
+            time.sleep(0.06)
+
+    def _busy_ticker(self):
+        """Gentle uniform pulse while transcribing/formatting."""
+        t0 = time.time()
+        while self._busy:
+            v = 0.22 + 0.14 * math.sin((time.time() - t0) * 6.0)
+            self.hud.set_levels([v] * HUD.NBARS)
+            time.sleep(0.06)
 
     def finish_recording(self):
         audio = self.recorder.stop()
         if audio is None or len(audio) < SAMPLE_RATE * 0.3:
-            self.hud.flash("✕ Zu kurz · verworfen")
+            self.hud.flash_msg("zu kurz · verworfen")
             self.title = self.IDLE
             return
         if self.cfg["sounds"]:
             play_sound("Pop")
-        self.hud.show("⚙️ Transkribiere …")
         self.title = self.BUSY
         self._busy = True
+        threading.Thread(target=self._busy_ticker, daemon=True).start()
         threading.Thread(target=self._process, args=(audio,), daemon=True).start()
 
     def _process(self, audio):
@@ -425,26 +523,33 @@ class LocalFlowApp(rumps.App):
                 wf.writeframes(pcm.tobytes())
 
             t0 = time.time()
-            text = self.whisper.transcribe(wav_path, self.cfg["language"],
-                                           load_dictionary())
+            text, lang = self.whisper.transcribe(wav_path, self.cfg["language"],
+                                                 load_dictionary())
             t1 = time.time()
             if not text or text.lower().strip(" .!?") in ("you", "thank you", ""):
-                self.hud.flash("✕ Nichts erkannt")
-                self.title = self.IDLE
                 self._busy = False
+                time.sleep(0.1)
+                self.hud.flash_msg("nichts erkannt")
+                self.title = self.IDLE
                 return
+            if self.cfg["language"] != "auto":
+                lang = self.cfg["language"]
             if self.cfg["cleanup"]:
-                self.hud.show("⚙️ Formatiere …")
-                text = ollama_cleanup(self.cfg, text)
+                text = ollama_cleanup(self.cfg, text, lang)
             t2 = time.time()
             self.last_text = text
+            self._busy = False
+            time.sleep(0.1)  # let the busy ticker exit before the flash
             paste_text(text)
-            self.hud.flash("✓ Eingefügt")
-            log(f"dictated {len(text)} chars (stt {t1-t0:.1f}s, cleanup {t2-t1:.1f}s)")
+            self.hud.flash_ok()
+            log(f"dictated {len(text)} chars, lang={lang} "
+                f"(stt {t1-t0:.1f}s, cleanup {t2-t1:.1f}s)")
             os.unlink(wav_path)
         except Exception as e:
             log(f"process error: {e}")
-            self.hud.flash("✕ Fehler · siehe Log")
+            self._busy = False
+            time.sleep(0.1)
+            self.hud.flash_msg("Fehler · siehe Log")
         finally:
             self.title = self.IDLE
             self._busy = False
