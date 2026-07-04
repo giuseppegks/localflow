@@ -194,8 +194,13 @@ class ParakeetEngine:
         log("parakeet ready")
 
     def transcribe(self, wav_path, language, prompt):
-        """Returns (text, ""): parakeet auto-detects but does not report."""
-        result = self.model.transcribe(wav_path)
+        """Returns (text, ""): parakeet auto-detects but does not report.
+
+        chunk_duration bounds the attention window: without it, long
+        recordings blow up memory on 8 GB and the call never returns.
+        """
+        result = self.model.transcribe(wav_path, chunk_duration=60.0,
+                                       overlap_duration=10.0)
         return " ".join(result.text.split()), ""
 
     def stop(self):
@@ -467,6 +472,8 @@ class LocalFlowApp(rumps.App):
         self.hold_active = False
         self.toggle_active = False
         self._busy = False
+        self._job_id = 0
+        self._killed_job = -1
         self.hud = HUD()
 
         self.status_item = rumps.MenuItem("Status: startet ...")
@@ -586,10 +593,25 @@ class LocalFlowApp(rumps.App):
             play_sound("Pop")
         self.title = self.BUSY
         self._busy = True
+        self._job_id += 1
+        job = self._job_id
         threading.Thread(target=self._busy_ticker, daemon=True).start()
-        threading.Thread(target=self._process, args=(audio,), daemon=True).start()
+        threading.Thread(target=self._process, args=(audio, job),
+                         daemon=True).start()
+        threading.Timer(90, self._watchdog, args=(job,)).start()
 
-    def _process(self, audio):
+    def _watchdog(self, job):
+        # The STT call cannot be interrupted, but the UI must never stay
+        # stuck: reset state and tell the user instead of pulsing forever.
+        if self._busy and self._job_id == job:
+            log("watchdog: processing >90s, resetting UI")
+            self._killed_job = job
+            self._busy = False
+            time.sleep(0.1)
+            self.hud.flash_msg("Timeout · siehe Log", seconds=3)
+            self.title = self.IDLE
+
+    def _process(self, audio, job):
         try:
             wav_path = "/tmp/localflow_rec.wav"
             pcm = (np.clip(audio, -1, 1) * 32767).astype(np.int16)
@@ -619,6 +641,10 @@ class LocalFlowApp(rumps.App):
                 text = ollama_cleanup(self.cfg, text, lang)
             t2 = time.time()
             self.last_text = text
+            if self._killed_job == job:
+                log("skipping paste: job was killed by watchdog "
+                    "(text im Menü unter 'Letztes Diktat kopieren')")
+                return
             self._busy = False
             time.sleep(0.1)  # let the busy ticker exit before the flash
             paste_text(text)
