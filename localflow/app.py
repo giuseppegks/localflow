@@ -22,6 +22,12 @@ import sounddevice as sd
 from pynput import keyboard
 from pynput.keyboard import Controller, Key
 
+import Foundation
+from AppKit import (NSBackingStoreBuffered, NSColor, NSFont, NSPanel,
+                    NSScreen, NSTextField, NSWindowStyleMaskBorderless,
+                    NSWindowStyleMaskNonactivatingPanel)
+from PyObjCTools import AppHelper
+
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "config.json"
 DICT_PATH = ROOT / "dictionary.txt"
@@ -223,6 +229,71 @@ def paste_text(text):
     p.communicate(old)
 
 
+class HUD:
+    """Floating status pill at the bottom of the screen (VoiceInk-style).
+
+    Shows recording/processing/done states so the user always sees what
+    LocalFlow is doing. Non-activating: focus stays in the target app.
+    All UI mutations are marshalled onto the main thread via callAfter.
+    """
+
+    W, H = 260, 44
+
+    def __init__(self):
+        rect = Foundation.NSMakeRect(0, 0, self.W, self.H)
+        style = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+        self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            rect, style, NSBackingStoreBuffered, False)
+        self.panel.setOpaque_(False)
+        self.panel.setBackgroundColor_(NSColor.clearColor())
+        self.panel.setLevel_(25)  # NSStatusWindowLevel: above normal windows
+        self.panel.setIgnoresMouseEvents_(True)
+        self.panel.setHidesOnDeactivate_(False)
+        # canJoinAllSpaces | fullScreenAuxiliary
+        self.panel.setCollectionBehavior_((1 << 0) | (1 << 8))
+        content = self.panel.contentView()
+        content.setWantsLayer_(True)
+        content.layer().setBackgroundColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(0.08, 0.92).CGColor())
+        content.layer().setCornerRadius_(self.H / 2.0)
+        self.label = NSTextField.alloc().initWithFrame_(
+            Foundation.NSMakeRect(10, (self.H - 20) / 2.0 - 1, self.W - 20, 20))
+        self.label.setBezeled_(False)
+        self.label.setDrawsBackground_(False)
+        self.label.setEditable_(False)
+        self.label.setSelectable_(False)
+        self.label.setAlignment_(2)  # NSTextAlignmentCenter (macOS)
+        self.label.setFont_(NSFont.systemFontOfSize_weight_(14, 0.3))
+        self.label.setTextColor_(NSColor.whiteColor())
+        content.addSubview_(self.label)
+        screen = NSScreen.mainScreen().frame()
+        self.panel.setFrameOrigin_(
+            Foundation.NSMakePoint((screen.size.width - self.W) / 2.0, 140))
+        self._gen = 0
+
+    def _apply(self, text):
+        self.label.setStringValue_(text)
+        self.panel.orderFrontRegardless()
+
+    def show(self, text):
+        self._gen += 1
+        AppHelper.callAfter(self._apply, text)
+
+    def flash(self, text, seconds=1.4):
+        self._gen += 1
+        gen = self._gen
+        AppHelper.callAfter(self._apply, text)
+        threading.Timer(seconds, lambda: self._hide_if(gen)).start()
+
+    def _hide_if(self, gen):
+        if gen == self._gen:
+            AppHelper.callAfter(self.panel.orderOut_, None)
+
+    def hide(self):
+        self._gen += 1
+        AppHelper.callAfter(self.panel.orderOut_, None)
+
+
 class LocalFlowApp(rumps.App):
     IDLE = "\U0001f3a4"       # microphone
     REC = "\U0001f534"        # red circle
@@ -237,6 +308,7 @@ class LocalFlowApp(rumps.App):
         self.hold_active = False
         self.toggle_active = False
         self._busy = False
+        self.hud = HUD()
 
         self.status_item = rumps.MenuItem("Status: startet ...")
         self.cleanup_item = rumps.MenuItem("AI-Cleanup", callback=self.toggle_cleanup)
@@ -317,17 +389,27 @@ class LocalFlowApp(rumps.App):
                 self.title = self.REC
                 if self.cfg["sounds"]:
                     play_sound("Tink")
+                threading.Thread(target=self._rec_ticker, daemon=True).start()
         except Exception as e:
             log(f"record start error: {e}")
+            self.hud.flash("✕ Mikrofon-Fehler")
             self.title = self.IDLE
+
+    def _rec_ticker(self):
+        t0 = time.time()
+        while self.recorder.recording:
+            self.hud.show(f"🔴 Aufnahme · {int(time.time() - t0)}s")
+            time.sleep(0.5)
 
     def finish_recording(self):
         audio = self.recorder.stop()
         if audio is None or len(audio) < SAMPLE_RATE * 0.3:
+            self.hud.flash("✕ Zu kurz · verworfen")
             self.title = self.IDLE
             return
         if self.cfg["sounds"]:
             play_sound("Pop")
+        self.hud.show("⚙️ Transkribiere …")
         self.title = self.BUSY
         self._busy = True
         threading.Thread(target=self._process, args=(audio,), daemon=True).start()
@@ -347,18 +429,22 @@ class LocalFlowApp(rumps.App):
                                            load_dictionary())
             t1 = time.time()
             if not text or text.lower().strip(" .!?") in ("you", "thank you", ""):
+                self.hud.flash("✕ Nichts erkannt")
                 self.title = self.IDLE
                 self._busy = False
                 return
             if self.cfg["cleanup"]:
+                self.hud.show("⚙️ Formatiere …")
                 text = ollama_cleanup(self.cfg, text)
             t2 = time.time()
             self.last_text = text
             paste_text(text)
+            self.hud.flash("✓ Eingefügt")
             log(f"dictated {len(text)} chars (stt {t1-t0:.1f}s, cleanup {t2-t1:.1f}s)")
             os.unlink(wav_path)
         except Exception as e:
             log(f"process error: {e}")
+            self.hud.flash("✕ Fehler · siehe Log")
         finally:
             self.title = self.IDLE
             self._busy = False
