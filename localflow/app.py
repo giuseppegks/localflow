@@ -24,12 +24,25 @@ import sounddevice as sd
 from pynput import keyboard
 from pynput.keyboard import Controller, Key
 
+import ctypes
+
 import Foundation
 from AppKit import (NSBackingStoreBuffered, NSColor, NSFont, NSImage,
                     NSImageView, NSPanel, NSScreen, NSTextField, NSView,
                     NSWindowStyleMaskBorderless,
                     NSWindowStyleMaskNonactivatingPanel)
 from PyObjCTools import AppHelper
+
+
+def boost_thread_qos():
+    """Promote the calling thread to USER_INTERACTIVE so macOS schedules it
+    on performance cores. Menu-bar apps default lower and App Nap makes
+    inference ~6x slower (measured 3s -> 19.5s)."""
+    try:
+        libc = ctypes.CDLL(None)
+        libc.pthread_set_qos_class_self_np(0x21, 0)  # QOS_CLASS_USER_INTERACTIVE
+    except Exception:
+        pass
 
 # GUI-launched apps miss the Homebrew PATH; parakeet needs ffmpeg from there.
 os.environ["PATH"] = "/opt/homebrew/bin:" + os.environ.get("PATH", "")
@@ -233,7 +246,15 @@ class ParakeetEngine:
             raise RuntimeError(self.error)
 
     def _worker(self):
+        boost_thread_qos()
         try:
+            import mlx.core as mx
+            try:
+                # Wire the weights into memory so idle periods don't evict
+                # them; otherwise the first dictation after a pause is slow.
+                mx.set_wired_limit(1600 * 1024 * 1024)
+            except Exception:
+                pass
             from parakeet_mlx import from_pretrained
             # Resolve the cached snapshot offline: from_pretrained's own hub
             # call fails in GUI-launched contexts and then misreads the repo
@@ -399,7 +420,7 @@ def paste_text(text):
     with kb.pressed(Key.cmd):
         kb.press("v")
         kb.release("v")
-    time.sleep(0.3)
+    time.sleep(0.15)
     p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
     p.communicate(old)
 
@@ -557,6 +578,12 @@ class LocalFlowApp(rumps.App):
         self._busy = False
         self._job_id = 0
         self._killed_job = -1
+        # Opt out of App Nap for the whole app lifetime.
+        self._activity = Foundation.NSProcessInfo.processInfo(
+        ).beginActivityWithOptions_reason_(
+            Foundation.NSActivityUserInitiated
+            | Foundation.NSActivityLatencyCritical,
+            "LocalFlow real-time dictation")
         self.hud = HUD()
 
         self.status_item = rumps.MenuItem("Status: startet ...")
@@ -701,6 +728,7 @@ class LocalFlowApp(rumps.App):
             self.title = self.IDLE
 
     def _process(self, audio, job):
+        boost_thread_qos()
         try:
             wav_path = "/tmp/localflow_rec.wav"
             pcm = (np.clip(audio, -1, 1) * 32767).astype(np.int16)
