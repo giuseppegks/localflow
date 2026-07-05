@@ -647,6 +647,12 @@ class HUD:
         self.label.setHidden_(True)
         self.panel.orderOut_(None)
 
+    def badge_recording(self, on):
+        """Red badge while the mic is live — a silent recording must never
+        look like an idle or stuck pill."""
+        color = NSColor.systemRedColor() if on else NSColor.systemGrayColor()
+        AppHelper.callAfter(self._apply_badge, color)
+
     def hide(self):
         self._deadline = 0.0
         AppHelper.callAfter(self._reset_and_hide)
@@ -745,6 +751,8 @@ class LocalFlowApp(rumps.App):
         key_mode = self.cfg.get("key_mode", "toggle")
 
         first_event = [True]
+        key_down_at = [0.0]
+        key_was_combo = [False]
 
         def on_press(key):
             if first_event[0]:
@@ -754,26 +762,41 @@ class LocalFlowApp(rumps.App):
             if key == hold_key:
                 if not self.ready:
                     self.hud.flash_msg("⏳ Modell lädt noch …")
-                elif key_mode == "toggle":
-                    on_toggle()
-                elif not self.toggle_active and not self._busy \
-                        and not self.hold_active:
-                    self.hold_active = True
-                    self.start_recording()
-            elif key == Key.space:
-                ctrl = Key.ctrl in pressed or Key.ctrl_l in pressed or Key.ctrl_r in pressed
-                alt = Key.alt in pressed or Key.alt_l in pressed
-                if ctrl and alt:
-                    if not self.ready:
-                        self.hud.flash_msg("⏳ Modell lädt noch …")
-                    else:
-                        on_toggle()
+                elif key_mode == "hold":
+                    if not self.toggle_active and not self._busy \
+                            and not self.hold_active:
+                        self.hold_active = True
+                        self.start_recording()
+                else:
+                    key_down_at[0] = time.time()
+                    key_was_combo[0] = False
+            else:
+                # Option used as a modifier (é, special chars, shortcuts):
+                # that is typing, not a dictation toggle.
+                if hold_key in pressed:
+                    key_was_combo[0] = True
+                if key == Key.space:
+                    ctrl = Key.ctrl in pressed or Key.ctrl_l in pressed or Key.ctrl_r in pressed
+                    alt = Key.alt in pressed or Key.alt_l in pressed
+                    if ctrl and alt:
+                        if not self.ready:
+                            self.hud.flash_msg("⏳ Modell lädt noch …")
+                        else:
+                            on_toggle()
 
         def on_release(key):
             pressed.discard(key)
-            if key_mode == "hold" and key == hold_key and self.hold_active:
+            if key != hold_key:
+                return
+            if key_mode == "hold" and self.hold_active:
                 self.hold_active = False
                 self.finish_recording()
+            elif key_mode == "toggle" and self.ready:
+                # Clean tap only: nothing else pressed while down, held
+                # briefly. Kills accidental starts from key combos.
+                if not key_was_combo[0] \
+                        and time.time() - key_down_at[0] < 0.5:
+                    on_toggle()
 
         listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         listener.start()
@@ -787,6 +810,7 @@ class LocalFlowApp(rumps.App):
                 self.stt.stream_start()
             if self.recorder.start():
                 self.title = self.REC
+                self.hud.badge_recording(True)
                 if self.cfg["sounds"]:
                     play_sound("Tink")
                 threading.Thread(target=self._rec_ticker, daemon=True).start()
@@ -798,10 +822,28 @@ class LocalFlowApp(rumps.App):
     def _rec_ticker(self):
         """Scrolling live waveform while recording."""
         history = [0.0] * HUD.NBARS
+        t0 = time.time()
+        peak = 0.0
         while self.recorder.recording:
-            history = history[1:] + [min(1.0, self.recorder.level * 14)]
+            lvl = self.recorder.level
+            peak = max(peak, lvl)
+            history = history[1:] + [min(1.0, lvl * 14)]
             self.hud.set_levels(history)
+            # Accidental-start guard (toggle mode): 12s recording without
+            # any speech means nobody meant to dictate — discard quietly.
+            if self.toggle_active and peak < 0.015 \
+                    and time.time() - t0 > 12:
+                self.toggle_active = False
+                self.recorder.stop()
+                if isinstance(self.stt, ParakeetEngine):
+                    self.stt.stream_abort()
+                self.hud.badge_recording(False)
+                self.hud.flash_msg("nichts gehört · gestoppt")
+                self.title = self.IDLE
+                log("silent recording auto-discarded (accidental start)")
+                return
             time.sleep(0.06)
+        self.hud.badge_recording(False)
         # Recording can end without user action (max_seconds hit in the
         # audio callback). Finish the dictation instead of freezing the HUD.
         if self.toggle_active and not self._busy:
