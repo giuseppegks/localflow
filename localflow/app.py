@@ -503,7 +503,18 @@ class HUD:
         screen = NSScreen.mainScreen().frame()
         self.panel.setFrameOrigin_(
             Foundation.NSMakePoint((screen.size.width - self.W) / 2.0, 140))
-        self._gen = 0
+        # Dead-man switch: every state sets a deadline, the janitor hides
+        # the panel once it passes. Active tickers keep extending it, so a
+        # stuck pill (thread race, killed worker, whatever) self-clears.
+        self._deadline = 0.0
+        threading.Thread(target=self._janitor, daemon=True).start()
+
+    def _janitor(self):
+        while True:
+            time.sleep(0.5)
+            if self._deadline and time.time() > self._deadline:
+                self._deadline = 0.0
+                AppHelper.callAfter(self._reset_and_hide)
 
     # -- main-thread appliers --
     def _apply_levels(self, levels):
@@ -529,25 +540,17 @@ class HUD:
     # -- thread-safe API --
     def set_levels(self, levels):
         levels = (list(levels) + [0.0] * self.NBARS)[:self.NBARS]
-        self._gen += 1
+        self._deadline = time.time() + 1.5
         AppHelper.callAfter(self._apply_levels, levels)
 
     def flash_ok(self, seconds=1.0):
-        self._gen += 1
-        gen = self._gen
+        self._deadline = time.time() + seconds
         AppHelper.callAfter(self._apply_badge, NSColor.systemGreenColor())
         AppHelper.callAfter(self._apply_levels, [0.15] * self.NBARS)
-        threading.Timer(seconds, lambda: self._hide_if(gen)).start()
 
     def flash_msg(self, text, seconds=1.4):
-        self._gen += 1
-        gen = self._gen
+        self._deadline = time.time() + seconds
         AppHelper.callAfter(self._apply_msg, text)
-        threading.Timer(seconds, lambda: self._hide_if(gen)).start()
-
-    def _hide_if(self, gen):
-        if gen == self._gen:
-            AppHelper.callAfter(self._reset_and_hide)
 
     def _reset_and_hide(self):
         self.badge.setContentTintColor_(NSColor.systemGrayColor())
@@ -555,7 +558,7 @@ class HUD:
         self.panel.orderOut_(None)
 
     def hide(self):
-        self._gen += 1
+        self._deadline = 0.0
         AppHelper.callAfter(self._reset_and_hide)
 
 
