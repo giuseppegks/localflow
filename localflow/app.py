@@ -187,6 +187,7 @@ class Recorder:
         self.stream = None
         self.recording = False
         self.level = 0.0
+        self.on_chunk = None  # live feed into the streaming STT engine
         self._lock = threading.Lock()
 
     def start(self):
@@ -204,6 +205,8 @@ class Recorder:
     def _callback(self, indata, frame_count, time_info, status):
         self.frames.append(indata.copy())
         self.level = float(np.sqrt(np.mean(indata ** 2)))
+        if self.on_chunk is not None:
+            self.on_chunk(indata[:, 0].copy())
         if len(self.frames) * frame_count / SAMPLE_RATE > self.cfg["max_seconds"]:
             self.recording = False
             raise sd.CallbackStop()
@@ -235,10 +238,12 @@ class ParakeetEngine:
         self.jobs = queue.Queue()
         self.ready = threading.Event()
         self.error = None
+        self._acc = []       # small audio chunks, flushed per ~1s
+        self._acc_len = 0
 
     def start(self):
         # MLX streams are bound to the thread that created them: loading
-        # and transcribing MUST happen on the same dedicated worker thread,
+        # and ALL inference MUST happen on the same dedicated worker thread,
         # otherwise "There is no Stream(gpu, 0) in current thread".
         threading.Thread(target=self._worker, daemon=True).start()
         self.ready.wait()
@@ -282,30 +287,102 @@ class ParakeetEngine:
             return
         self.ready.set()
         log("parakeet ready")
+
+        # Command loop. Streaming transcribes DURING recording, so stopping
+        # a dictation only finalizes — long recordings finish near-instantly.
+        stream = None
+
+        def close_stream(s):
+            try:
+                s.__exit__(None, None, None)
+            except Exception:
+                pass
+
         while True:
-            wav_path, out = self.jobs.get()
-            if wav_path is None:
+            item = self.jobs.get()
+            kind = item[0]
+            if kind == "quit":
                 return
             try:
-                # chunk_duration bounds the attention window: without it,
-                # long recordings blow up memory on 8 GB and never return.
-                r = self.model.transcribe(wav_path, chunk_duration=60.0,
-                                          overlap_duration=10.0)
-                out.put((" ".join(r.text.split()), None))
+                if kind == "start":
+                    if stream is not None:
+                        close_stream(stream)
+                    stream = self.model.transcribe_stream(
+                        context_size=(256, 256))
+                    stream.__enter__()
+                elif kind == "audio":
+                    if stream is not None:
+                        stream.add_audio(mx.array(item[1]))
+                elif kind == "finish":
+                    out = item[1]
+                    if stream is None:
+                        out.put(("", None))
+                    else:
+                        text = " ".join(stream.result.text.split())
+                        close_stream(stream)
+                        stream = None
+                        out.put((text, None))
+                elif kind == "abort":
+                    if stream is not None:
+                        close_stream(stream)
+                        stream = None
+                elif kind == "file":
+                    r = self.model.transcribe(item[1], chunk_duration=60.0,
+                                              overlap_duration=10.0)
+                    item[2].put((" ".join(r.text.split()), None))
             except Exception as e:
-                out.put((None, e))
+                log(f"parakeet worker error ({kind}): {e}")
+                if kind == "finish":
+                    item[1].put((None, e))
+                elif kind == "file":
+                    item[2].put((None, e))
+                if stream is not None:
+                    close_stream(stream)
+                    stream = None
+
+    # -- streaming API (thread-safe: everything goes through the job queue) --
+    def stream_start(self):
+        self._acc = []
+        self._acc_len = 0
+        self.jobs.put(("start",))
+
+    def feed(self, chunk):
+        """Called from the audio callback; batches ~1s before handing off."""
+        self._acc.append(chunk)
+        self._acc_len += len(chunk)
+        if self._acc_len >= SAMPLE_RATE:
+            self.jobs.put(("audio", np.concatenate(self._acc)))
+            self._acc = []
+            self._acc_len = 0
+
+    def stream_finish(self):
+        if self._acc:
+            self.jobs.put(("audio", np.concatenate(self._acc)))
+            self._acc = []
+            self._acc_len = 0
+        out = queue.Queue()
+        self.jobs.put(("finish", out))
+        text, err = out.get()
+        if err:
+            raise err
+        return text
+
+    def stream_abort(self):
+        self._acc = []
+        self._acc_len = 0
+        self.jobs.put(("abort",))
 
     def transcribe(self, wav_path, language, prompt):
-        """Returns (text, ""): parakeet auto-detects but does not report."""
+        """Batch fallback. Returns (text, ""): parakeet does not report lang."""
         out = queue.Queue()
-        self.jobs.put((wav_path, out))
+        self.jobs.put(("file", wav_path, out))
         text, err = out.get()
         if err:
             raise err
         return text, ""
 
     def stop(self):
-        self.jobs.put((None, None))
+        self.jobs.put(("quit",))
         self.model = None
 
 
@@ -574,6 +651,7 @@ class LocalFlowApp(rumps.App):
         self.recorder = Recorder(self.cfg)
         if self.cfg.get("stt_engine", "parakeet") == "parakeet":
             self.stt = ParakeetEngine(self.cfg)
+            self.recorder.on_chunk = self.stt.feed
         else:
             self.stt = WhisperServer(self.cfg)
         self.last_text = ""
@@ -692,6 +770,8 @@ class LocalFlowApp(rumps.App):
     # ---- record / transcribe / paste ----
     def start_recording(self):
         try:
+            if isinstance(self.stt, ParakeetEngine):
+                self.stt.stream_start()
             if self.recorder.start():
                 self.title = self.REC
                 if self.cfg["sounds"]:
@@ -726,6 +806,8 @@ class LocalFlowApp(rumps.App):
     def finish_recording(self):
         audio = self.recorder.stop()
         if audio is None or len(audio) < SAMPLE_RATE * 0.3:
+            if isinstance(self.stt, ParakeetEngine):
+                self.stt.stream_abort()
             self.hud.flash_msg("zu kurz · verworfen")
             self.title = self.IDLE
             return
@@ -754,17 +836,23 @@ class LocalFlowApp(rumps.App):
     def _process(self, audio, job):
         boost_thread_qos()
         try:
-            wav_path = "/tmp/localflow_rec.wav"
-            pcm = (np.clip(audio, -1, 1) * 32767).astype(np.int16)
-            with wave.open(wav_path, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(SAMPLE_RATE)
-                wf.writeframes(pcm.tobytes())
-
             t0 = time.time()
-            text, lang = self.stt.transcribe(wav_path, self.cfg["language"],
-                                             load_dictionary())
+            if isinstance(self.stt, ParakeetEngine):
+                # Audio was transcribed live during recording; this only
+                # finalizes the last second — fast regardless of length.
+                text, lang = self.stt.stream_finish(), ""
+            else:
+                wav_path = "/tmp/localflow_rec.wav"
+                pcm = (np.clip(audio, -1, 1) * 32767).astype(np.int16)
+                with wave.open(wav_path, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(SAMPLE_RATE)
+                    wf.writeframes(pcm.tobytes())
+                text, lang = self.stt.transcribe(wav_path,
+                                                 self.cfg["language"],
+                                                 load_dictionary())
+                os.unlink(wav_path)
             t1 = time.time()
             if not text or text.lower().strip(" .!?") in ("you", "thank you", ""):
                 self._busy = False
@@ -793,7 +881,6 @@ class LocalFlowApp(rumps.App):
             self.hud.flash_ok()
             log(f"dictated {len(text)} chars, lang={lang} "
                 f"(stt {t1-t0:.1f}s, cleanup {t2-t1:.1f}s)")
-            os.unlink(wav_path)
         except Exception as e:
             log(f"process error: {e}")
             self._busy = False
