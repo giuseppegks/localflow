@@ -327,8 +327,8 @@ class ParakeetEngine:
                         close_stream(stream)
                         stream = None
                 elif kind == "file":
-                    r = self.model.transcribe(item[1], chunk_duration=60.0,
-                                              overlap_duration=10.0)
+                    r = self.model.transcribe(item[1], chunk_duration=30.0,
+                                              overlap_duration=5.0)
                     item[2].put((" ".join(r.text.split()), None))
             except Exception as e:
                 log(f"parakeet worker error ({kind}): {e}")
@@ -347,13 +347,19 @@ class ParakeetEngine:
         self.jobs.put(("start",))
 
     def feed(self, chunk):
-        """Called from the audio callback; batches ~1s before handing off."""
+        """Called from the audio callback; batches ~4s before handing off.
+        Chunk size dominates streaming speed: 1s chunks run at 0.79x
+        realtime (falls behind under load), 4s chunks at 0.19x (5x margin).
+        """
         self._acc.append(chunk)
         self._acc_len += len(chunk)
-        if self._acc_len >= SAMPLE_RATE:
+        if self._acc_len >= SAMPLE_RATE * 4:
             self.jobs.put(("audio", np.concatenate(self._acc)))
             self._acc = []
             self._acc_len = 0
+
+    def backlog(self):
+        return self.jobs.qsize()
 
     def stream_finish(self):
         if self._acc:
@@ -370,6 +376,13 @@ class ParakeetEngine:
     def stream_abort(self):
         self._acc = []
         self._acc_len = 0
+        # Drop queued audio first — a stale backlog is exactly why we abort;
+        # without this, follow-up jobs would wait behind it anyway.
+        try:
+            while True:
+                self.jobs.get_nowait()
+        except queue.Empty:
+            pass
         self.jobs.put(("abort",))
 
     def transcribe(self, wav_path, language, prompt):
@@ -837,11 +850,20 @@ class LocalFlowApp(rumps.App):
         boost_thread_qos()
         try:
             t0 = time.time()
-            if isinstance(self.stt, ParakeetEngine):
+            streamed = (isinstance(self.stt, ParakeetEngine)
+                        and self.stt.backlog() <= 3)
+            if streamed:
                 # Audio was transcribed live during recording; this only
-                # finalizes the last second — fast regardless of length.
+                # finalizes the tail — fast regardless of length.
                 text, lang = self.stt.stream_finish(), ""
             else:
+                # Backlogged stream (system under heavy load) or whisper:
+                # drop the stream and batch-process the full recording,
+                # which is faster than draining a stale queue.
+                if isinstance(self.stt, ParakeetEngine):
+                    log(f"stream backlog {self.stt.backlog()}, "
+                        "falling back to batch")
+                    self.stt.stream_abort()
                 wav_path = "/tmp/localflow_rec.wav"
                 pcm = (np.clip(audio, -1, 1) * 32767).astype(np.int16)
                 with wave.open(wav_path, "wb") as wf:
