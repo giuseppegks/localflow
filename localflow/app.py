@@ -563,6 +563,7 @@ class LocalFlowApp(rumps.App):
     IDLE = "\U0001f3a4"       # microphone
     REC = "\U0001f534"        # red circle
     BUSY = "⚙️"     # gear
+    WAIT = "⏳"     # model loading
 
     def __init__(self):
         super().__init__(self.IDLE, quit_button=None)
@@ -578,6 +579,7 @@ class LocalFlowApp(rumps.App):
         self._busy = False
         self._job_id = 0
         self._killed_job = -1
+        self.ready = False
         # Opt out of App Nap for the whole app lifetime.
         self._activity = Foundation.NSProcessInfo.processInfo(
         ).beginActivityWithOptions_reason_(
@@ -613,12 +615,21 @@ class LocalFlowApp(rumps.App):
     # ---- boot ----
     def _boot(self):
         try:
+            self.title = self.WAIT
             self.status_item.title = "Status: Modell lädt …"
+            t0 = time.time()
             self.stt.start()
+            self.ready = True
+            self.title = self.IDLE
             self.status_item.title = "Status: bereit (⌥ rechts = start/stop)"
+            self.hud.flash_msg("✓ LocalFlow bereit", seconds=2.0)
+            if self.cfg["sounds"]:
+                play_sound("Glass")
+            log(f"boot complete in {time.time()-t0:.0f}s")
         except Exception as e:
             log(f"boot error: {e}")
             self.status_item.title = f"Status: FEHLER – {e}"
+            self.hud.flash_msg("✕ Start-Fehler · siehe Log", seconds=5.0)
 
     # ---- hotkeys ----
     # Single pynput Listener for both hold-to-talk and the toggle combo.
@@ -647,7 +658,9 @@ class LocalFlowApp(rumps.App):
                 log("key events flowing (input monitoring OK)")
             pressed.add(key)
             if key == hold_key:
-                if key_mode == "toggle":
+                if not self.ready:
+                    self.hud.flash_msg("⏳ Modell lädt noch …")
+                elif key_mode == "toggle":
                     on_toggle()
                 elif not self.toggle_active and not self._busy \
                         and not self.hold_active:
@@ -657,7 +670,10 @@ class LocalFlowApp(rumps.App):
                 ctrl = Key.ctrl in pressed or Key.ctrl_l in pressed or Key.ctrl_r in pressed
                 alt = Key.alt in pressed or Key.alt_l in pressed
                 if ctrl and alt:
-                    on_toggle()
+                    if not self.ready:
+                        self.hud.flash_msg("⏳ Modell lädt noch …")
+                    else:
+                        on_toggle()
 
         def on_release(key):
             pressed.discard(key)
