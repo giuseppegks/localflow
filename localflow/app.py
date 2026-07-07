@@ -61,6 +61,11 @@ CONFIG_PATH = ROOT / "config.json"
 DICT_PATH = ROOT / "dictionary.txt"
 LOG_PATH = ROOT / "localflow.log"
 
+# The .app bundle we are running from (None in dev mode). Needed to
+# relaunch ourselves after a CoreAudio wedge.
+APP_BUNDLE = next((str(p) for p in Path(sys.executable).parents
+                   if p.suffix == ".app"), None)
+
 DEFAULT_CONFIG = {
     "hold_key": "alt_r",
     "key_mode": "toggle",  # "toggle": tap to start/stop; "hold": push-to-talk
@@ -189,6 +194,11 @@ class Recorder:
         self.level = 0.0
         self.on_chunk = None  # live feed into the streaming STT engine
         self._lock = threading.Lock()
+        # Set when a stream stop wedged against CoreAudio. From that point
+        # every Pa_OpenStream in this process blocks on the same poisoned
+        # HAL mutex (sampled live 2026-07-07): audio is dead until the
+        # process restarts.
+        self.wedged = False
 
     def start(self):
         with self._lock:
@@ -235,8 +245,9 @@ class Recorder:
         t.start()
         t.join(3.0)
         if t.is_alive():
+            self.wedged = True
             log("recorder: stream stop wedged (CoreAudio deadlock), "
-                "stream abandoned")
+                "stream abandoned; audio poisoned until restart")
         if not frames:
             return None
         return np.concatenate(frames, axis=0).flatten()
@@ -827,11 +838,51 @@ class LocalFlowApp(rumps.App):
         listener.join()
 
     # ---- record / transcribe / paste ----
+    def _audio_reset(self):
+        """A wedged CoreAudio session never heals inside this process:
+        deliver what we can, then relaunch the app."""
+        if getattr(self, "_resetting", False):
+            return
+        self._resetting = True
+        log("audio wedged beyond recovery: restarting LocalFlow")
+        self.hud.flash_msg("Audio-Reset · Neustart …", seconds=3.0)
+
+        def _go():
+            time.sleep(1.2)  # let the flash render
+            if APP_BUNDLE:
+                subprocess.Popen(
+                    ["sh", "-c", f'sleep 1; open "{APP_BUNDLE}"'])
+            os._exit(0)
+
+        threading.Thread(target=_go, daemon=True).start()
+
     def start_recording(self):
+        if self.recorder.wedged:
+            self._audio_reset()
+            return
         try:
             if isinstance(self.stt, ParakeetEngine):
                 self.stt.stream_start()
-            if self.recorder.start():
+            # Pa_OpenStream blocks forever on the poisoned HAL mutex after
+            # an earlier wedge — never wait on it without a deadline.
+            box = {}
+
+            def _open():
+                try:
+                    box["ok"] = self.recorder.start()
+                except Exception as e:
+                    box["err"] = e
+
+            t = threading.Thread(target=_open, daemon=True)
+            t.start()
+            t.join(4.0)
+            if t.is_alive():
+                self.recorder.wedged = True
+                self._audio_reset()
+                return
+            if "err" in box:
+                raise box["err"]
+            if box.get("ok"):
                 self.title = self.REC
                 self.hud.badge_recording(True)
                 if self.cfg["sounds"]:
@@ -886,6 +937,9 @@ class LocalFlowApp(rumps.App):
         if audio is None or len(audio) < SAMPLE_RATE * 0.3:
             if isinstance(self.stt, ParakeetEngine):
                 self.stt.stream_abort()
+            if self.recorder.wedged:
+                self._audio_reset()
+                return
             self.hud.flash_msg("zu kurz · verworfen")
             self.title = self.IDLE
             return
@@ -968,6 +1022,11 @@ class LocalFlowApp(rumps.App):
             self.hud.flash_ok()
             log(f"dictated {len(text)} chars, lang={lang} "
                 f"(stt {t1-t0:.1f}s, cleanup {t2-t1:.1f}s)")
+            # Text is safely pasted; if the stop wedged on the way here,
+            # restart now instead of dying on the NEXT dictation.
+            if self.recorder.wedged:
+                time.sleep(0.5)
+                self._audio_reset()
         except Exception as e:
             log(f"process error: {e}")
             self._busy = False

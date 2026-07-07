@@ -43,6 +43,7 @@ def test_wedged_stop():
     assert dt < 4.5, f"stop blocked {dt:.1f}s"
     assert audio is not None and len(audio) == 1600, "captured audio lost"
     assert rec.recording is False and rec.stream is None
+    assert rec.wedged is True, "wedge must poison the recorder (app restarts on it)"
     return dt
 
 
