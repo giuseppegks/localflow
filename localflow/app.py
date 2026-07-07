@@ -213,17 +213,33 @@ class Recorder:
 
     def stop(self):
         with self._lock:
-            if self.stream is None:
-                return None
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
+            stream, self.stream = self.stream, None
+            frames, self.frames = self.frames, []
             self.recording = False
-            if not self.frames:
-                return None
-            audio = np.concatenate(self.frames, axis=0).flatten()
-            self.frames = []
-            return audio
+        if stream is None:
+            return None
+
+        # PortAudio's stop can deadlock against CoreAudio's own start/stop
+        # notification (AB-BA on the HAL mutex; froze the whole app
+        # 2026-07-07). Never block the caller on it: close on a sacrificial
+        # thread, and if that wedges, abandon the stream object and keep
+        # the audio that was already captured.
+        def _close():
+            try:
+                stream.stop()
+                stream.close()
+            except Exception as e:
+                log(f"recorder close error: {e}")
+
+        t = threading.Thread(target=_close, daemon=True)
+        t.start()
+        t.join(3.0)
+        if t.is_alive():
+            log("recorder: stream stop wedged (CoreAudio deadlock), "
+                "stream abandoned")
+        if not frames:
+            return None
+        return np.concatenate(frames, axis=0).flatten()
 
 
 class ParakeetEngine:
@@ -738,15 +754,20 @@ class LocalFlowApp(rumps.App):
         hold_key = getattr(Key, self.cfg["hold_key"], Key.alt_r)
         pressed = set()
 
+        # start/finish run on throwaway threads: this callback runs inside
+        # the CGEventTap; if it blocks (e.g. audio stop wedging against
+        # CoreAudio), macOS disables the tap and every hotkey dies.
         def on_toggle():
             if self.hold_active or self._busy:
                 return
             if self.toggle_active:
                 self.toggle_active = False
-                self.finish_recording()
+                threading.Thread(target=self.finish_recording,
+                                 daemon=True).start()
             else:
                 self.toggle_active = True
-                self.start_recording()
+                threading.Thread(target=self.start_recording,
+                                 daemon=True).start()
 
         key_mode = self.cfg.get("key_mode", "toggle")
 
@@ -766,7 +787,8 @@ class LocalFlowApp(rumps.App):
                     if not self.toggle_active and not self._busy \
                             and not self.hold_active:
                         self.hold_active = True
-                        self.start_recording()
+                        threading.Thread(target=self.start_recording,
+                                         daemon=True).start()
                 else:
                     key_down_at[0] = time.time()
                     key_was_combo[0] = False
@@ -790,7 +812,8 @@ class LocalFlowApp(rumps.App):
                 return
             if key_mode == "hold" and self.hold_active:
                 self.hold_active = False
-                self.finish_recording()
+                threading.Thread(target=self.finish_recording,
+                                 daemon=True).start()
             elif key_mode == "toggle" and self.ready:
                 # Clean tap only: nothing else pressed while down, held
                 # briefly. Kills accidental starts from key combos.
