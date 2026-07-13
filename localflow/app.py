@@ -812,6 +812,75 @@ class HUD:
         AppHelper.callAfter(self._reset_and_hide)
 
 
+class DictationState:
+    """Single lock-guarded state machine replacing the old scattered
+    hold_active/toggle_active/_busy bools, which were mutated from many
+    threads and could stick (a stuck _busy silently ate every hotkey).
+    PROCESSING self-expires: even if every safety net fails, the hotkey
+    comes back after EXPIRE_S."""
+
+    IDLE, RECORDING, PROCESSING = "idle", "recording", "processing"
+    EXPIRE_S = 95
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._state = self.IDLE
+        self._mode = None  # "hold" | "toggle" while RECORDING
+        self._expires_at = 0.0
+
+    def _expire_locked(self):
+        """Returns True if an expired PROCESSING was reset (log outside)."""
+        if self._state == self.PROCESSING and time.time() > self._expires_at:
+            self._state = self.IDLE
+            self._mode = None
+            return True
+        return False
+
+    def get(self):
+        with self._lock:
+            expired = self._expire_locked()
+            state, mode = self._state, self._mode
+        if expired:
+            log("event=busy_expired (processing state auto-reset)")
+        return state, mode
+
+    def is_recording(self):
+        return self.get()[0] == self.RECORDING
+
+    def is_processing(self):
+        return self.get()[0] == self.PROCESSING
+
+    def mode(self):
+        return self.get()[1]
+
+    def try_begin_recording(self, mode):
+        with self._lock:
+            expired = self._expire_locked()
+            ok = self._state == self.IDLE
+            if ok:
+                self._state = self.RECORDING
+                self._mode = mode
+        if expired:
+            log("event=busy_expired (processing state auto-reset)")
+        return ok
+
+    def try_finish(self):
+        """RECORDING -> PROCESSING, exactly one winner (double-taps,
+        tickers and sleep handler race for this)."""
+        with self._lock:
+            if self._state != self.RECORDING:
+                return False
+            self._state = self.PROCESSING
+            self._mode = None
+            self._expires_at = time.time() + self.EXPIRE_S
+            return True
+
+    def to_idle(self):
+        with self._lock:
+            self._state = self.IDLE
+            self._mode = None
+
+
 class _WakeObserver(Foundation.NSObject):
     """NSWorkspace sleep/wake bridge. Notifications arrive on the main
     run loop; hand off to a thread immediately, never block here."""
@@ -846,9 +915,7 @@ class LocalFlowApp(rumps.App):
         else:
             self.stt = WhisperServer(self.cfg)
         self.last_text = ""
-        self.hold_active = False
-        self.toggle_active = False
-        self._busy = False
+        self.state = DictationState()
         self._job_id = 0
         self._killed_job = -1
         self.ready = False
@@ -915,7 +982,8 @@ class LocalFlowApp(rumps.App):
                     if self._last_use_ts else float("inf"))
             if idle > 3600:
                 time.sleep(25)
-                if not self.recorder.recording and not self._busy:
+                st, _ = self.state.get()
+                if st == DictationState.IDLE:
                     try:
                         warm = "/tmp/localflow_rewarm.wav"
                         with wave.open(warm, "wb") as wf:
@@ -932,9 +1000,7 @@ class LocalFlowApp(rumps.App):
 
     def _on_sleep(self):
         log("event=sleep")
-        if self.recorder.recording:
-            self.toggle_active = False
-            self.hold_active = False
+        if self.state.try_finish():
             self.finish_recording()
 
     # ---- boot ----
@@ -966,15 +1032,17 @@ class LocalFlowApp(rumps.App):
         # start/finish run on throwaway threads: this callback runs inside
         # the CGEventTap; if it blocks (e.g. audio stop wedging against
         # CoreAudio), macOS disables the tap and every hotkey dies.
+        # State transitions are atomic (DictationState), so double-taps
+        # and races can only ever win once.
         def on_toggle():
-            if self.hold_active or self._busy:
+            st, mode = self.state.get()
+            if st == DictationState.PROCESSING or mode == "hold":
                 return
-            if self.toggle_active:
-                self.toggle_active = False
-                threading.Thread(target=self.finish_recording,
-                                 daemon=True).start()
-            else:
-                self.toggle_active = True
+            if st == DictationState.RECORDING:
+                if self.state.try_finish():
+                    threading.Thread(target=self.finish_recording,
+                                     daemon=True).start()
+            elif self.state.try_begin_recording("toggle"):
                 threading.Thread(target=self.start_recording,
                                  daemon=True).start()
 
@@ -993,9 +1061,7 @@ class LocalFlowApp(rumps.App):
                 if not self.ready:
                     self.hud.flash_msg("⏳ Modell lädt noch …")
                 elif key_mode == "hold":
-                    if not self.toggle_active and not self._busy \
-                            and not self.hold_active:
-                        self.hold_active = True
+                    if self.state.try_begin_recording("hold"):
                         threading.Thread(target=self.start_recording,
                                          daemon=True).start()
                 else:
@@ -1019,10 +1085,10 @@ class LocalFlowApp(rumps.App):
             pressed.discard(key)
             if key != hold_key:
                 return
-            if key_mode == "hold" and self.hold_active:
-                self.hold_active = False
-                threading.Thread(target=self.finish_recording,
-                                 daemon=True).start()
+            if key_mode == "hold" and self.state.mode() == "hold":
+                if self.state.try_finish():
+                    threading.Thread(target=self.finish_recording,
+                                     daemon=True).start()
             elif key_mode == "toggle" and self.ready:
                 # Clean tap only: nothing else pressed while down, held
                 # briefly. Kills accidental starts from key combos.
@@ -1081,8 +1147,7 @@ class LocalFlowApp(rumps.App):
                 self._start_fail_count += 1
                 if isinstance(self.stt, ParakeetEngine):
                     self.stt.stream_abort()
-                self.toggle_active = False
-                self.hold_active = False
+                self.state.to_idle()
                 if self._start_fail_count >= 2:
                     self._audio_reset()
                     return
@@ -1090,8 +1155,7 @@ class LocalFlowApp(rumps.App):
                 self.title = self.IDLE
         except Exception as e:
             log(f"record start error: {e}")
-            self.toggle_active = False
-            self.hold_active = False
+            self.state.to_idle()
             self.hud.flash_msg("Mikrofon-Fehler")
             self.title = self.IDLE
 
@@ -1107,45 +1171,45 @@ class LocalFlowApp(rumps.App):
             self.hud.set_levels(history)
             # Accidental-start guard (toggle mode): 12s recording without
             # any speech means nobody meant to dictate — discard quietly.
-            if self.toggle_active and peak < 0.015 \
-                    and time.time() - t0 > 12:
-                self.toggle_active = False
+            if self.state.mode() == "toggle" and peak < 0.015 \
+                    and time.time() - t0 > 12 and self.state.try_finish():
                 self.recorder.stop()
                 if isinstance(self.stt, ParakeetEngine):
                     self.stt.stream_abort()
+                self.state.to_idle()
                 self.hud.badge_recording(False)
                 self.hud.flash_msg("nichts gehört · gestoppt")
                 self.title = self.IDLE
-                log("silent recording auto-discarded (accidental start)")
+                log(f"event=silent_discard peak={peak:.4f}")
                 return
             time.sleep(0.06)
         self.hud.badge_recording(False)
         # Recording can end without user action (max_seconds hit in the
-        # audio callback). Finish the dictation instead of freezing the HUD.
-        if self.toggle_active and not self._busy:
-            self.toggle_active = False
+        # capture reader). Finish the dictation instead of freezing the HUD.
+        if self.state.try_finish():
             self.finish_recording()
 
     def _busy_ticker(self):
         """Gentle uniform pulse while transcribing/formatting."""
         t0 = time.time()
-        while self._busy:
+        while self.state.is_processing():
             v = 0.22 + 0.14 * math.sin((time.time() - t0) * 6.0)
             self.hud.set_levels([v] * HUD.NBARS)
             time.sleep(0.06)
 
     def finish_recording(self):
+        # Caller has already won state.try_finish(): state is PROCESSING.
         audio = self.recorder.stop()
         if audio is None or len(audio) < SAMPLE_RATE * 0.3:
             if isinstance(self.stt, ParakeetEngine):
                 self.stt.stream_abort()
+            self.state.to_idle()
             self.hud.flash_msg("zu kurz · verworfen")
             self.title = self.IDLE
             return
         if self.cfg["sounds"]:
             play_sound("Pop")
         self.title = self.BUSY
-        self._busy = True
         self._job_id += 1
         job = self._job_id
         threading.Thread(target=self._busy_ticker, daemon=True).start()
@@ -1156,10 +1220,10 @@ class LocalFlowApp(rumps.App):
     def _watchdog(self, job):
         # The STT call cannot be interrupted, but the UI must never stay
         # stuck: reset state and tell the user instead of pulsing forever.
-        if self._busy and self._job_id == job:
+        if self.state.is_processing() and self._job_id == job:
             log("watchdog: processing >90s, resetting UI")
             self._killed_job = job
-            self._busy = False
+            self.state.to_idle()
             time.sleep(0.1)
             self.hud.flash_msg("Timeout · siehe Log", seconds=3)
             self.title = self.IDLE
@@ -1195,7 +1259,7 @@ class LocalFlowApp(rumps.App):
                 os.unlink(wav_path)
             t1 = time.time()
             if not text or text.lower().strip(" .!?") in ("you", "thank you", ""):
-                self._busy = False
+                self.state.to_idle()
                 time.sleep(0.1)
                 self.hud.flash_msg("nichts erkannt")
                 self.title = self.IDLE
@@ -1215,7 +1279,7 @@ class LocalFlowApp(rumps.App):
                 log("skipping paste: job was killed by watchdog "
                     "(text im Menü unter 'Letztes Diktat kopieren')")
                 return
-            self._busy = False
+            self.state.to_idle()
             time.sleep(0.1)  # let the busy ticker exit before the flash
             paste_text(text)
             self.hud.flash_ok()
@@ -1224,12 +1288,12 @@ class LocalFlowApp(rumps.App):
                 f"(stt {t1-t0:.1f}s, cleanup {t2-t1:.1f}s)")
         except Exception as e:
             log(f"process error: {e}")
-            self._busy = False
+            self.state.to_idle()
             time.sleep(0.1)
             self.hud.flash_msg("Fehler · siehe Log")
         finally:
             self.title = self.IDLE
-            self._busy = False
+            self.state.to_idle()
 
     # ---- menu callbacks ----
     def toggle_cleanup(self, sender):
@@ -1252,11 +1316,11 @@ class LocalFlowApp(rumps.App):
         subprocess.Popen(["open", "-t", str(DICT_PATH)])
 
     def diagnose(self, _):
+        st, mode = self.state.get()
         info = {
             "ready": self.ready,
-            "busy": self._busy,
-            "toggle_active": self.toggle_active,
-            "hold_active": self.hold_active,
+            "state": st,
+            "mode": mode,
             "recording": self.recorder.recording,
             "device": self.recorder.device_name,
             "child_alive": self.recorder.child_alive(),
