@@ -60,11 +60,25 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT / "config.json"
 DICT_PATH = ROOT / "dictionary.txt"
 LOG_PATH = ROOT / "localflow.log"
+STDERR_LOG = ROOT / "localflow.stderr.log"
+LOG_MAX_BYTES = 512 * 1024
 
 # The .app bundle we are running from (None in dev mode). Needed to
 # relaunch ourselves after a CoreAudio wedge.
 APP_BUNDLE = next((str(p) for p in Path(sys.executable).parents
                    if p.suffix == ".app"), None)
+
+# GUI-launched (open -a): stdout/stderr go nowhere, so interpreter
+# tracebacks vanish. Route both into a file. Dev mode keeps the terminal.
+if APP_BUNDLE:
+    try:
+        if STDERR_LOG.exists() and STDERR_LOG.stat().st_size > LOG_MAX_BYTES:
+            STDERR_LOG.replace(STDERR_LOG.with_suffix(".log.1"))
+        _stderr_f = open(STDERR_LOG, "ab", buffering=0)
+        os.dup2(_stderr_f.fileno(), 1)
+        os.dup2(_stderr_f.fileno(), 2)
+    except Exception:
+        pass
 
 DEFAULT_CONFIG = {
     "hold_key": "alt_r",
@@ -156,6 +170,11 @@ def detect_lang(text):
 
 
 def log(msg):
+    try:
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > LOG_MAX_BYTES:
+            LOG_PATH.replace(LOG_PATH.with_suffix(".log.1"))
+    except Exception:
+        pass
     with open(LOG_PATH, "a") as f:
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
 
