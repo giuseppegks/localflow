@@ -65,3 +65,5 @@ Traceback (most recent call last):
 ModuleNotFoundError: No module named 'numpy'
 capture_worker: stream stop wedged (CoreAudio deadlock), exiting for respawn
 capture_worker: stream stop wedged (CoreAudio deadlock), exiting for respawn
+capture_worker: stream stop wedged (CoreAudio deadlock), exiting for respawn
+capture_worker: stream stop wedged (CoreAudio deadlock), exiting for respawn

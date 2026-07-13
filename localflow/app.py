@@ -107,6 +107,11 @@ DEFAULT_CONFIG = {
     # After >1h idle + wake, run one silent clip through the model so the
     # compressed-out weights page back in off the user's critical path.
     "rewarm_on_wake": True,
+    # Keep the model warm during idle-without-sleep: macOS compresses the
+    # ~760MB model pages under memory pressure, making the first dictation
+    # after a pause take 10s+ (measured 13.3s on 2026-07-13). A silent
+    # clip every N idle minutes keeps it hot for 1-2s GPU. 0 = off.
+    "keep_warm_minutes": 20,
 }
 
 SAMPLE_RATE = 16000
@@ -208,6 +213,14 @@ def load_dictionary():
 def play_sound(name):
     subprocess.Popen(["afplay", f"/System/Library/Sounds/{name}.aiff"],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def write_silent_wav(path, seconds=1):
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(b"\x00\x00" * SAMPLE_RATE * seconds)
 
 
 WORKER_PATH = Path(__file__).resolve().parent / "capture_worker.py"
@@ -438,11 +451,7 @@ class ParakeetEngine:
             # First inference compiles the graph (~5s); absorb it at boot
             # with a short silent clip so the first real dictation is fast.
             warm = "/tmp/localflow_warmup.wav"
-            with wave.open(warm, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(SAMPLE_RATE)
-                wf.writeframes(b"\x00\x00" * SAMPLE_RATE)
+            write_silent_wav(warm)
             self.model.transcribe(warm)
             os.unlink(warm)
         except Exception as e:
@@ -932,6 +941,7 @@ class LocalFlowApp(rumps.App):
         self.wake_count = 0
         self._boot_ts = time.time()
         self._last_use_ts = 0.0
+        self._last_warm_ts = 0.0
         self._start_fail_count = 0
         # Opt out of App Nap for the whole app lifetime.
         self._activity = Foundation.NSProcessInfo.processInfo(
@@ -994,24 +1004,47 @@ class LocalFlowApp(rumps.App):
                 time.sleep(25)
                 st, _ = self.state.get()
                 if st == DictationState.IDLE:
-                    try:
-                        warm = "/tmp/localflow_rewarm.wav"
-                        with wave.open(warm, "wb") as wf:
-                            wf.setnchannels(1)
-                            wf.setsampwidth(2)
-                            wf.setframerate(SAMPLE_RATE)
-                            wf.writeframes(b"\x00\x00" * SAMPLE_RATE)
-                        t0 = time.time()
-                        self.stt.transcribe(warm, "", "")
-                        os.unlink(warm)
-                        log(f"event=rewarm took_s={time.time()-t0:.1f}")
-                    except Exception as e:
-                        log(f"rewarm error: {e}")
+                    self._warm_model("rewarm")
 
     def _on_sleep(self):
         log("event=sleep")
         if self.state.try_finish():
             self.finish_recording()
+
+    # ---- model warmth ----
+    def _warm_model(self, label):
+        """One silent clip through the model: pages compressed-out weights
+        back in. took_s doubles as a coldness probe."""
+        try:
+            warm = f"/tmp/localflow_{label}.wav"
+            write_silent_wav(warm)
+            t0 = time.time()
+            self.stt.transcribe(warm, "", "")
+            os.unlink(warm)
+            self._last_warm_ts = time.time()
+            took = time.time() - t0
+            if took > 2 or label == "rewarm":
+                log(f"event={label} took_s={took:.1f}")
+        except Exception as e:
+            log(f"{label} error: {e}")
+
+    def _keep_warm(self):
+        """Idle-without-sleep keep-warm: memory pressure compresses the
+        model out even when the Mac never sleeps (first dictation after
+        53 min idle measured 13.3s). One silent clip per idle interval
+        keeps it hot."""
+        interval_min = self.cfg.get("keep_warm_minutes", 20)
+        if not interval_min or not isinstance(self.stt, ParakeetEngine):
+            return
+        while True:
+            time.sleep(60)
+            last = max(self._last_use_ts, self._last_warm_ts,
+                       self._boot_ts)
+            if time.time() - last < interval_min * 60:
+                continue
+            if self.state.get()[0] != DictationState.IDLE:
+                continue
+            self._warm_model("keepwarm")
 
     # ---- boot ----
     def _boot(self):
@@ -1027,6 +1060,10 @@ class LocalFlowApp(rumps.App):
             if self.cfg["sounds"]:
                 play_sound("Glass")
             log(f"boot complete in {time.time()-t0:.0f}s")
+            # Pre-spawn the capture child (no stream opened, no mic
+            # indicator): the first dictation skips the ~1s spawn cost.
+            self.recorder.ensure_child()
+            threading.Thread(target=self._keep_warm, daemon=True).start()
         except Exception as e:
             log(f"boot error: {e}")
             self.status_item.title = f"Status: FEHLER – {e}"
