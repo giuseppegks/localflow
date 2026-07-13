@@ -1,1 +1,67 @@
 capture_worker: stream stop wedged (CoreAudio deadlock), exiting for respawn
+Traceback (most recent call last):
+  File "/Users/giuseppegeukes/repos/localflow/localflow/capture_worker.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+Traceback (most recent call last):
+  File "/Users/giuseppegeukes/repos/localflow/localflow/capture_worker.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+Traceback (most recent call last):
+  File "/Users/giuseppegeukes/repos/localflow/localflow/capture_worker.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+Traceback (most recent call last):
+  File "/Users/giuseppegeukes/repos/localflow/localflow/capture_worker.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+Traceback (most recent call last):
+  File "/Users/giuseppegeukes/repos/localflow/localflow/capture_worker.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+Traceback (most recent call last):
+  File "/Users/giuseppegeukes/repos/localflow/localflow/capture_worker.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+Traceback (most recent call last):
+  File "/Users/giuseppegeukes/repos/localflow/localflow/capture_worker.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+Traceback (most recent call last):
+  File "/Users/giuseppegeukes/repos/localflow/localflow/capture_worker.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+Traceback (most recent call last):
+  File "/Users/giuseppegeukes/repos/localflow/localflow/capture_worker.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+Traceback (most recent call last):
+  File "/Users/giuseppegeukes/repos/localflow/localflow/capture_worker.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+Traceback (most recent call last):
+  File "/Users/giuseppegeukes/repos/localflow/localflow/capture_worker.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+Traceback (most recent call last):
+  File "/Users/giuseppegeukes/repos/localflow/localflow/capture_worker.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+Traceback (most recent call last):
+  File "/Users/giuseppegeukes/repos/localflow/localflow/capture_worker.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+Traceback (most recent call last):
+  File "/Users/giuseppegeukes/repos/localflow/localflow/capture_worker.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+Traceback (most recent call last):
+  File "/Users/giuseppegeukes/repos/localflow/localflow/capture_worker.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+Traceback (most recent call last):
+  File "/Users/giuseppegeukes/repos/localflow/localflow/capture_worker.py", line 28, in <module>
+    import numpy as np
+ModuleNotFoundError: No module named 'numpy'
+capture_worker: stream stop wedged (CoreAudio deadlock), exiting for respawn
+capture_worker: stream stop wedged (CoreAudio deadlock), exiting for respawn

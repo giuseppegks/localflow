@@ -212,6 +212,13 @@ def play_sound(name):
 
 WORKER_PATH = Path(__file__).resolve().parent / "capture_worker.py"
 
+# The capture child MUST run on the venv interpreter. Inside the .app
+# bundle sys.executable is py2app's launcher, which has no venv
+# site-packages: the child then dies on `import numpy` and every
+# recording fails (hit live 2026-07-13).
+_VENV_PY = ROOT / ".venv" / "bin" / "python"
+CHILD_PY = str(_VENV_PY) if _VENV_PY.exists() else sys.executable
+
 
 class CaptureClient:
     """Drop-in replacement for the old in-process Recorder: audio capture
@@ -247,7 +254,7 @@ class CaptureClient:
     # -- child lifecycle --
     def _spawn_locked(self):
         self._proc = subprocess.Popen(
-            [sys.executable, "-u", str(WORKER_PATH)],
+            [CHILD_PY, "-u", str(WORKER_PATH)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=open(STDERR_LOG, "ab"))
         self._spawned_at = time.time()
