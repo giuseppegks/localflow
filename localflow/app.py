@@ -204,72 +204,177 @@ def play_sound(name):
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-class Recorder:
+WORKER_PATH = Path(__file__).resolve().parent / "capture_worker.py"
+
+
+class CaptureClient:
+    """Drop-in replacement for the old in-process Recorder: audio capture
+    runs in a killable child process (capture_worker.py). PortAudio's
+    stop() can deadlock against CoreAudio's HAL mutex and poison every
+    later Pa_OpenStream in the process — in the child that costs a ~0.3s
+    SIGKILL+respawn instead of a full app relaunch, and the dictation
+    survives because frames stream live into the parent."""
+
+    START_TIMEOUT = 4.0
+    STOP_TIMEOUT = 3.0
+    MAX_CHILD_AGE = 15 * 60  # stale HAL view after idle: respawn first
+
     def __init__(self, cfg):
         self.cfg = cfg
         self.frames = []
-        self.stream = None
         self.recording = False
         self.level = 0.0
         self.on_chunk = None  # live feed into the streaming STT engine
-        self._lock = threading.Lock()
-        # Set when a stream stop wedged against CoreAudio. From that point
-        # every Pa_OpenStream in this process blocks on the same poisoned
-        # HAL mutex (sampled live 2026-07-07): audio is dead until the
-        # process restarts.
-        self.wedged = False
+        self.device_name = "?"
+        self.device_rate = 0
+        self.open_ms = -1
+        self.wedge_count = 0
+        self._spawn_lock = threading.Lock()
+        self._proc = None
+        self._spawned_at = 0.0
+        self._started = threading.Event()
+        self._stopped = threading.Event()
+        self._error = None
+        self._max_samples = int(SAMPLE_RATE * cfg["max_seconds"])
+        self._nsamples = 0
 
-    def start(self):
-        with self._lock:
-            if self.recording:
-                return False
-            self.frames = []
-            self.stream = sd.InputStream(
-                samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-                callback=self._callback)
-            self.stream.start()
-            self.recording = True
+    # -- child lifecycle --
+    def _spawn_locked(self):
+        self._proc = subprocess.Popen(
+            [sys.executable, "-u", str(WORKER_PATH)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=open(STDERR_LOG, "ab"))
+        self._spawned_at = time.time()
+        threading.Thread(target=self._reader, args=(self._proc,),
+                         daemon=True).start()
+
+    def _kill_locked(self):
+        proc, self._proc = self._proc, None
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def ensure_child(self, max_age=None):
+        with self._spawn_lock:
+            alive = self._proc is not None and self._proc.poll() is None
+            stale = (alive and max_age is not None
+                     and time.time() - self._spawned_at > max_age)
+            if alive and not stale:
+                return
+            if stale:
+                log(f"event=child_stale_respawn "
+                    f"age_s={int(time.time() - self._spawned_at)}")
+            self._kill_locked()
+            self._spawn_locked()
+
+    def respawn(self, reason):
+        log(f"event=child_respawn reason=\"{reason}\"")
+        with self._spawn_lock:
+            self._kill_locked()
+            self._spawn_locked()
+
+    def child_alive(self):
+        return self._proc is not None and self._proc.poll() is None
+
+    def child_age(self):
+        return time.time() - self._spawned_at if self._proc else -1
+
+    def _send(self, cmd):
+        try:
+            self._proc.stdin.write((cmd + "\n").encode())
+            self._proc.stdin.flush()
             return True
+        except Exception:
+            return False
 
-    def _callback(self, indata, frame_count, time_info, status):
-        self.frames.append(indata.copy())
-        self.level = float(np.sqrt(np.mean(indata ** 2)))
-        if self.on_chunk is not None:
-            self.on_chunk(indata[:, 0].copy())
-        if len(self.frames) * frame_count / SAMPLE_RATE > self.cfg["max_seconds"]:
-            self.recording = False
-            raise sd.CallbackStop()
+    # -- packet reader (one thread per child; exits on child EOF) --
+    def _reader(self, proc):
+        import struct
+        f = proc.stdout
+        while True:
+            head = f.read(4)
+            if len(head) < 4:
+                return
+            n = struct.unpack(">I", head)[0]
+            data = f.read(n)
+            if len(data) < n:
+                return
+            kind, payload = data[:1], data[1:]
+            if kind == b"A":
+                if not self.recording:
+                    continue
+                chunk = np.frombuffer(payload, dtype=np.float32)
+                self.frames.append(chunk)
+                self._nsamples += len(chunk)
+                self.level = float(np.sqrt(np.mean(chunk ** 2)))
+                if self.on_chunk is not None:
+                    self.on_chunk(chunk)
+                if self._nsamples > self._max_samples:
+                    # _rec_ticker notices and finishes the dictation,
+                    # mirroring the old CallbackStop behavior.
+                    self.recording = False
+            elif kind == b"J":
+                try:
+                    msg = json.loads(payload)
+                except Exception:
+                    continue
+                ev = msg.get("event")
+                if ev == "started":
+                    self.device_name = msg.get("device", "?")
+                    self.device_rate = msg.get("rate", 0) or 0
+                    self._started.set()
+                elif ev == "stopped":
+                    self._stopped.set()
+                elif ev == "error":
+                    self._error = msg.get("error", "?")
+                    log(f"capture child error: {self._error}")
+                    self._started.set()
+                    self._stopped.set()
+
+    # -- Recorder-compatible interface --
+    def start(self):
+        if self.recording:
+            return False
+        self.ensure_child(max_age=self.MAX_CHILD_AGE)
+        for attempt in (1, 2):
+            self.frames = []
+            self._nsamples = 0
+            self._error = None
+            self._started.clear()
+            self._stopped.clear()
+            t0 = time.time()
+            if (self._send("START") and self._started.wait(self.START_TIMEOUT)
+                    and not self._error):
+                self.open_ms = int((time.time() - t0) * 1000)
+                self.recording = True
+                return True
+            if attempt == 1:
+                self.respawn("start timeout/error")
+        log("capture start failed after respawn")
+        return False
 
     def stop(self):
-        with self._lock:
-            stream, self.stream = self.stream, None
-            frames, self.frames = self.frames, []
-            self.recording = False
-        if stream is None:
-            return None
-
-        # PortAudio's stop can deadlock against CoreAudio's own start/stop
-        # notification (AB-BA on the HAL mutex; froze the whole app
-        # 2026-07-07). Never block the caller on it: close on a sacrificial
-        # thread, and if that wedges, abandon the stream object and keep
-        # the audio that was already captured.
-        def _close():
-            try:
-                stream.stop()
-                stream.close()
-            except Exception as e:
-                log(f"recorder close error: {e}")
-
-        t = threading.Thread(target=_close, daemon=True)
-        t.start()
-        t.join(3.0)
-        if t.is_alive():
-            self.wedged = True
-            log("recorder: stream stop wedged (CoreAudio deadlock), "
-                "stream abandoned; audio poisoned until restart")
+        self.recording = False
+        frames, self.frames = self.frames, []
+        self._stopped.clear()
+        ok = self._send("STOP") and self._stopped.wait(self.STOP_TIMEOUT)
+        if not ok:
+            self.wedge_count += 1
+            log(f"event=child_wedge_respawn device=\"{self.device_name}\" "
+                f"wedges={self.wedge_count}")
+            threading.Thread(target=self.respawn, args=("stop wedge",),
+                             daemon=True).start()
         if not frames:
             return None
-        return np.concatenate(frames, axis=0).flatten()
+        return np.concatenate(frames)
+
+    def shutdown(self):
+        with self._spawn_lock:
+            if self._proc is not None:
+                self._send("QUIT")
+                self._kill_locked()
 
 
 class ParakeetEngine:
@@ -713,7 +818,7 @@ class LocalFlowApp(rumps.App):
     def __init__(self):
         super().__init__(self.IDLE, quit_button=None)
         self.cfg = load_config()
-        self.recorder = Recorder(self.cfg)
+        self.recorder = CaptureClient(self.cfg)
         if self.cfg.get("stt_engine", "parakeet") == "parakeet":
             self.stt = ParakeetEngine(self.cfg)
             self.recorder.on_chunk = self.stt.feed
@@ -726,6 +831,10 @@ class LocalFlowApp(rumps.App):
         self._job_id = 0
         self._killed_job = -1
         self.ready = False
+        self.wake_count = 0
+        self._boot_ts = time.time()
+        self._last_use_ts = 0.0
+        self._start_fail_count = 0
         # Opt out of App Nap for the whole app lifetime.
         self._activity = Foundation.NSProcessInfo.processInfo(
         ).beginActivityWithOptions_reason_(
@@ -748,10 +857,11 @@ class LocalFlowApp(rumps.App):
             self.lang_items[code] = item
         self.copy_item = rumps.MenuItem("Letztes Diktat kopieren", callback=self.copy_last)
         self.dict_item = rumps.MenuItem("Wörterbuch öffnen", callback=self.open_dict)
+        self.diag_item = rumps.MenuItem("Diagnose", callback=self.diagnose)
         self.menu = [
             self.status_item, None,
             self.cleanup_item, self.lang_menu, None,
-            self.copy_item, self.dict_item, None,
+            self.copy_item, self.dict_item, self.diag_item, None,
             rumps.MenuItem("Beenden", callback=self.quit_app),
         ]
 
@@ -858,12 +968,12 @@ class LocalFlowApp(rumps.App):
 
     # ---- record / transcribe / paste ----
     def _audio_reset(self):
-        """A wedged CoreAudio session never heals inside this process:
-        deliver what we can, then relaunch the app."""
+        """Last resort only: capture-child respawns failed repeatedly,
+        something above the child is broken. Relaunch the app."""
         if getattr(self, "_resetting", False):
             return
         self._resetting = True
-        log("audio wedged beyond recovery: restarting LocalFlow")
+        log("audio broken beyond child respawn: restarting LocalFlow")
         self.hud.flash_msg("Audio-Reset · Neustart …", seconds=3.0)
 
         def _go():
@@ -876,39 +986,43 @@ class LocalFlowApp(rumps.App):
         threading.Thread(target=_go, daemon=True).start()
 
     def start_recording(self):
-        if self.recorder.wedged:
-            self._audio_reset()
-            return
         try:
             if isinstance(self.stt, ParakeetEngine):
                 self.stt.stream_start()
-            # Pa_OpenStream blocks forever on the poisoned HAL mutex after
-            # an earlier wedge — never wait on it without a deadline.
-            box = {}
-
-            def _open():
-                try:
-                    box["ok"] = self.recorder.start()
-                except Exception as e:
-                    box["err"] = e
-
-            t = threading.Thread(target=_open, daemon=True)
-            t.start()
-            t.join(4.0)
-            if t.is_alive():
-                self.recorder.wedged = True
-                self._audio_reset()
-                return
-            if "err" in box:
-                raise box["err"]
-            if box.get("ok"):
+            # CaptureClient.start() carries its own deadlines (4s ack,
+            # kill+respawn+retry once) — it can fail but never block long.
+            if self.recorder.start():
+                self._start_fail_count = 0
+                idle_gap = (int(time.time() - self._last_use_ts)
+                            if self._last_use_ts else -1)
+                self._last_use_ts = time.time()
+                log(f"event=record_start "
+                    f"device=\"{self.recorder.device_name}\" "
+                    f"rate={self.recorder.device_rate:.0f} "
+                    f"open_ms={self.recorder.open_ms} "
+                    f"idle_gap_s={idle_gap} "
+                    f"child_age_s={int(self.recorder.child_age())} "
+                    f"wake_count={self.wake_count}")
                 self.title = self.REC
                 self.hud.badge_recording(True)
                 if self.cfg["sounds"]:
                     play_sound("Tink")
                 threading.Thread(target=self._rec_ticker, daemon=True).start()
+            else:
+                self._start_fail_count += 1
+                if isinstance(self.stt, ParakeetEngine):
+                    self.stt.stream_abort()
+                self.toggle_active = False
+                self.hold_active = False
+                if self._start_fail_count >= 2:
+                    self._audio_reset()
+                    return
+                self.hud.flash_msg("Mikrofon-Fehler")
+                self.title = self.IDLE
         except Exception as e:
             log(f"record start error: {e}")
+            self.toggle_active = False
+            self.hold_active = False
             self.hud.flash_msg("Mikrofon-Fehler")
             self.title = self.IDLE
 
@@ -956,9 +1070,6 @@ class LocalFlowApp(rumps.App):
         if audio is None or len(audio) < SAMPLE_RATE * 0.3:
             if isinstance(self.stt, ParakeetEngine):
                 self.stt.stream_abort()
-            if self.recorder.wedged:
-                self._audio_reset()
-                return
             self.hud.flash_msg("zu kurz · verworfen")
             self.title = self.IDLE
             return
@@ -1039,13 +1150,9 @@ class LocalFlowApp(rumps.App):
             time.sleep(0.1)  # let the busy ticker exit before the flash
             paste_text(text)
             self.hud.flash_ok()
+            self._last_use_ts = time.time()
             log(f"dictated {len(text)} chars, lang={lang} "
                 f"(stt {t1-t0:.1f}s, cleanup {t2-t1:.1f}s)")
-            # Text is safely pasted; if the stop wedged on the way here,
-            # restart now instead of dying on the NEXT dictation.
-            if self.recorder.wedged:
-                time.sleep(0.5)
-                self._audio_reset()
         except Exception as e:
             log(f"process error: {e}")
             self._busy = False
@@ -1075,7 +1182,33 @@ class LocalFlowApp(rumps.App):
     def open_dict(self, _):
         subprocess.Popen(["open", "-t", str(DICT_PATH)])
 
+    def diagnose(self, _):
+        info = {
+            "ready": self.ready,
+            "busy": self._busy,
+            "toggle_active": self.toggle_active,
+            "hold_active": self.hold_active,
+            "recording": self.recorder.recording,
+            "device": self.recorder.device_name,
+            "child_alive": self.recorder.child_alive(),
+            "child_age_s": int(self.recorder.child_age()),
+            "wedge_count": self.recorder.wedge_count,
+            "wake_count": self.wake_count,
+            "uptime_s": int(time.time() - self._boot_ts),
+            "last_use_ago_s": (int(time.time() - self._last_use_ts)
+                               if self._last_use_ts else -1),
+            "engine": type(self.stt).__name__,
+            "backlog": (self.stt.backlog()
+                        if isinstance(self.stt, ParakeetEngine) else 0),
+        }
+        dump = json.dumps(info)
+        log(f"event=diagnose {dump}")
+        p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+        p.communicate(dump.encode("utf-8"))
+        self.hud.flash_msg("Diagnose → Log + Zwischenablage", seconds=2.0)
+
     def quit_app(self, _):
+        self.recorder.shutdown()
         self.stt.stop()
         rumps.quit_application()
 
