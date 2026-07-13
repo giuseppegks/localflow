@@ -104,6 +104,9 @@ DEFAULT_CONFIG = {
     "max_seconds": 180,
     "sounds": True,
     "cleanup_min_words": 6,
+    # After >1h idle + wake, run one silent clip through the model so the
+    # compressed-out weights page back in off the user's critical path.
+    "rewarm_on_wake": True,
 }
 
 SAMPLE_RATE = 16000
@@ -1178,9 +1181,12 @@ class LocalFlowApp(rumps.App):
                     self.stt.stream_abort()
                 self.state.to_idle()
                 self.hud.badge_recording(False)
-                self.hud.flash_msg("nichts gehört · gestoppt")
+                self.hud.flash_msg("nichts gehört · gestoppt", seconds=2.5)
+                if self.cfg["sounds"]:
+                    play_sound("Basso")
                 self.title = self.IDLE
-                log(f"event=silent_discard peak={peak:.4f}")
+                log(f"event=silent_discard peak={peak:.4f} "
+                    f"device=\"{self.recorder.device_name}\"")
                 return
             time.sleep(0.06)
         self.hud.badge_recording(False)
@@ -1204,8 +1210,11 @@ class LocalFlowApp(rumps.App):
             if isinstance(self.stt, ParakeetEngine):
                 self.stt.stream_abort()
             self.state.to_idle()
-            self.hud.flash_msg("zu kurz · verworfen")
+            self.hud.flash_msg("zu kurz · verworfen", seconds=2.5)
+            if self.cfg["sounds"]:
+                play_sound("Basso")
             self.title = self.IDLE
+            log(f"event=too_short samples={0 if audio is None else len(audio)}")
             return
         if self.cfg["sounds"]:
             play_sound("Pop")
@@ -1243,8 +1252,8 @@ class LocalFlowApp(rumps.App):
                 # drop the stream and batch-process the full recording,
                 # which is faster than draining a stale queue.
                 if isinstance(self.stt, ParakeetEngine):
-                    log(f"stream backlog {self.stt.backlog()}, "
-                        "falling back to batch")
+                    log(f"event=stream_backlog_batch "
+                        f"backlog={self.stt.backlog()}")
                     self.stt.stream_abort()
                 wav_path = "/tmp/localflow_rec.wav"
                 pcm = (np.clip(audio, -1, 1) * 32767).astype(np.int16)
@@ -1261,8 +1270,11 @@ class LocalFlowApp(rumps.App):
             if not text or text.lower().strip(" .!?") in ("you", "thank you", ""):
                 self.state.to_idle()
                 time.sleep(0.1)
-                self.hud.flash_msg("nichts erkannt")
+                self.hud.flash_msg("nichts erkannt", seconds=2.5)
+                if self.cfg["sounds"]:
+                    play_sound("Basso")
                 self.title = self.IDLE
+                log(f"event=no_text raw=\"{(text or '')[:40]}\"")
                 return
             if self.cfg["language"] != "auto":
                 lang = self.cfg["language"]
@@ -1283,9 +1295,16 @@ class LocalFlowApp(rumps.App):
             time.sleep(0.1)  # let the busy ticker exit before the flash
             paste_text(text)
             self.hud.flash_ok()
+            idle_gap = (int(t0 - self._last_use_ts)
+                        if self._last_use_ts else -1)
             self._last_use_ts = time.time()
             log(f"dictated {len(text)} chars, lang={lang} "
-                f"(stt {t1-t0:.1f}s, cleanup {t2-t1:.1f}s)")
+                f"(stt {t1-t0:.1f}s, cleanup {t2-t1:.1f}s) "
+                f"event=dictated streamed={streamed} "
+                f"device=\"{self.recorder.device_name}\" "
+                f"idle_gap_s={idle_gap} "
+                f"child_age_s={int(self.recorder.child_age())} "
+                f"wake_count={self.wake_count}")
         except Exception as e:
             log(f"process error: {e}")
             self.state.to_idle()
