@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- Presence watchdog: the main agent (com.giu.localflow) only fires
+     `open -a` once at login (KeepAlive=false, deliberately: the app is
+     adhoc-signed and the `open` launch path is the one proven to keep
+     the TCC grants). If the app ever dies without its self-restart
+     landing, this brings it back within 60s. `open -a` on an already
+     running app is a no-op, so the poll is harmless. -->
+<dict>
+    <key>Label</key>
+    <string>com.giu.localflow.watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>pgrep -f "LocalFlow.app/Contents/MacOS/" >/dev/null || /usr/bin/open -a "$HOME/Applications/LocalFlow.app"</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/tmp/localflow-watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/localflow-watchdog.log</string>
+</dict>
+</plist>
