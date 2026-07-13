@@ -27,10 +27,13 @@ from pynput.keyboard import Controller, Key
 import ctypes
 
 import Foundation
+import objc
 from AppKit import (NSBackingStoreBuffered, NSColor, NSFont, NSImage,
                     NSImageView, NSPanel, NSScreen, NSTextField, NSView,
                     NSWindowStyleMaskBorderless,
-                    NSWindowStyleMaskNonactivatingPanel)
+                    NSWindowStyleMaskNonactivatingPanel, NSWorkspace,
+                    NSWorkspaceDidWakeNotification,
+                    NSWorkspaceWillSleepNotification)
 from PyObjCTools import AppHelper
 
 
@@ -809,6 +812,24 @@ class HUD:
         AppHelper.callAfter(self._reset_and_hide)
 
 
+class _WakeObserver(Foundation.NSObject):
+    """NSWorkspace sleep/wake bridge. Notifications arrive on the main
+    run loop; hand off to a thread immediately, never block here."""
+
+    def initWithApp_(self, app):
+        self = objc.super(_WakeObserver, self).init()
+        if self is None:
+            return None
+        self.app = app
+        return self
+
+    def onWake_(self, note):
+        threading.Thread(target=self.app._on_wake, daemon=True).start()
+
+    def onSleep_(self, note):
+        threading.Thread(target=self.app._on_sleep, daemon=True).start()
+
+
 class LocalFlowApp(rumps.App):
     IDLE = "\U0001f3a4"       # microphone
     REC = "\U0001f534"        # red circle
@@ -865,8 +886,56 @@ class LocalFlowApp(rumps.App):
             rumps.MenuItem("Beenden", callback=self.quit_app),
         ]
 
+        # Sleep/wake: CoreAudio device state goes stale across sleep and
+        # was the prime trigger for first-memo-after-idle failures.
+        self._wake_obs = _WakeObserver.alloc().initWithApp_(self)
+        nc = NSWorkspace.sharedWorkspace().notificationCenter()
+        nc.addObserver_selector_name_object_(
+            self._wake_obs, b"onWake:", NSWorkspaceDidWakeNotification, None)
+        nc.addObserver_selector_name_object_(
+            self._wake_obs, b"onSleep:", NSWorkspaceWillSleepNotification,
+            None)
+
         threading.Thread(target=self._boot, daemon=True).start()
         threading.Thread(target=self._hotkeys, daemon=True).start()
+
+    # ---- sleep/wake ----
+    def _on_wake(self):
+        self.wake_count += 1
+        log(f"event=wake wake_count={self.wake_count}")
+        # Fresh child = fresh PortAudio/HAL view, BEFORE the first hotkey.
+        if not self.recorder.recording:
+            self.recorder.respawn("post-wake fresh HAL view")
+        # Optional re-warm: after a long sleep the wired limit does not
+        # stop macOS from compressing the model pages; one silent clip
+        # pages them back in off the user's critical path.
+        if (self.cfg.get("rewarm_on_wake", True) and self.ready
+                and isinstance(self.stt, ParakeetEngine)):
+            idle = (time.time() - self._last_use_ts
+                    if self._last_use_ts else float("inf"))
+            if idle > 3600:
+                time.sleep(25)
+                if not self.recorder.recording and not self._busy:
+                    try:
+                        warm = "/tmp/localflow_rewarm.wav"
+                        with wave.open(warm, "wb") as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(SAMPLE_RATE)
+                            wf.writeframes(b"\x00\x00" * SAMPLE_RATE)
+                        t0 = time.time()
+                        self.stt.transcribe(warm, "", "")
+                        os.unlink(warm)
+                        log(f"event=rewarm took_s={time.time()-t0:.1f}")
+                    except Exception as e:
+                        log(f"rewarm error: {e}")
+
+    def _on_sleep(self):
+        log("event=sleep")
+        if self.recorder.recording:
+            self.toggle_active = False
+            self.hold_active = False
+            self.finish_recording()
 
     # ---- boot ----
     def _boot(self):
