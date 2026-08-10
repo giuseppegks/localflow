@@ -674,16 +674,22 @@ def ollama_cleanup(cfg, text, lang=""):
 
 
 def paste_text(text):
-    """Insert text at cursor: clipboard swap + Cmd+V, then restore clipboard."""
+    """Insert text at cursor: clipboard swap + Cmd+V, then restore clipboard.
+
+    The restore must wait until the target app has actually serviced the
+    paste. Under memory pressure that can take way longer than the old
+    0.15s, which restored the old clipboard BEFORE the paste landed and
+    made dictation silently insert nothing (seen 2026-08-10).
+    """
     old = subprocess.run(["pbpaste"], capture_output=True).stdout
     p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
     p.communicate(text.encode("utf-8"))
-    time.sleep(0.06)
+    time.sleep(0.25)
     kb = Controller()
     with kb.pressed(Key.cmd):
         kb.press("v")
         kb.release("v")
-    time.sleep(0.15)
+    time.sleep(1.5)
     p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
     p.communicate(old)
 
