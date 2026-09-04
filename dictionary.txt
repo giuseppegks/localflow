@@ -20,3 +20,4 @@ Anthropic
 Hetzner
 Syncthing
 LocalFlow
+Giulius
