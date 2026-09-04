@@ -72,7 +72,7 @@ echo "==> Selbsttest"
 # 6. App-Bundle
 echo "==> LocalFlow.app bauen"
 rm -rf build dist
-.venv/bin/python setup.py py2app -A >/dev/null
+.venv/bin/python -W ignore setup.py py2app -A >/dev/null 2>&1
 test -d dist/LocalFlow.app || { echo "FEHLER: Build fehlgeschlagen"; exit 1; }
 
 if [[ "${LOCALFLOW_BUILD_ONLY:-0}" == "1" ]]; then
