@@ -6,9 +6,9 @@
     <string>com.giu.localflow</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/open</string>
-        <string>-a</string>
-        <string>/Users/giuseppegeukes/Applications/LocalFlow.app</string>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>/usr/bin/open -a "$HOME/Applications/LocalFlow.app"</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

@@ -1,4 +1,9 @@
 .venv/
 models/
-localflow.log
+build/
+dist/
 __pycache__/
+*.pyc
+localflow.log
+localflow.stderr.log
+.DS_Store

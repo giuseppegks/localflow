@@ -2,6 +2,26 @@
 
 Private Wispr-Flow-Alternative. 100% lokal auf dem Mac: Audio, Transkription und Nachbearbeitung verlassen die Maschine nie.
 
+## Installation (neuer Mac, 10 Minuten + Download)
+
+Voraussetzungen: Mac mit Apple Silicon (M1 oder neuer), macOS 14+, [Homebrew](https://brew.sh) installiert. Alles andere holt das Skript selbst (uv, Python 3.12.12, alle Pakete exakt gepinnt, ffmpeg, Modell).
+
+```bash
+git clone https://github.com/giuseppegks/localflow.git ~/repos/localflow
+cd ~/repos/localflow
+./install.sh
+```
+
+Danach in **Systemeinstellungen → Datenschutz & Sicherheit** für LocalFlow freigeben: **Mikrofon**, **Bedienungshilfen**, **Eingabemonitoring**. Dann die App einmal neu starten (`open -a ~/Applications/LocalFlow.app`).
+
+Test: Textfeld anklicken, rechte ⌥ tippen, sprechen, nochmal ⌥ tippen. Fertig.
+
+Hinweise:
+- Der Repo-Ordner darf danach nicht verschoben werden (die App zeigt auf `~/repos/localflow` + `.venv`).
+- Eigennamen, die falsch erkannt werden: in `dictionary.txt` eintragen (ein Name pro Zeile), App neu starten.
+- Update: `git pull && ./install.sh` (das Skript ist wiederholbar).
+- Ollama ist optional (nur für den AI-Cleanup-Schalter im Menü); ohne Ollama läuft alles.
+
 ## Pipeline
 
 ```
@@ -25,7 +45,7 @@ Menü (🎤 in der Menüleiste): AI-Cleanup an/aus, Sprache erzwingen (auto/de/n
 
 ## Start & Autostart
 
-Die App läuft als **`~/Applications/LocalFlow.app`** (py2app alias mode — referenziert dieses Repo + `.venv`, Repo nicht verschieben). Autostart: LaunchAgent `com.giu.localflow` (`open -a LocalFlow.app` bei Login), plist liegt im Repo.
+Die App läuft als **`~/Applications/LocalFlow.app`** (py2app alias mode: referenziert dieses Repo + `.venv`, Repo nicht verschieben). Autostart: LaunchAgent `com.giu.localflow` (`open -a LocalFlow.app` bei Login), plist liegt im Repo.
 
 Entwicklung/Debug aus dem Terminal: `./run.sh` (Prozess läuft dann unter Terminal-TCC-Identität).
 
@@ -39,7 +59,7 @@ codesign --force -s - ~/Applications/LocalFlow.app
 
 ## macOS-Freigaben (TCC)
 
-**LocalFlow** braucht: Bedienungshilfen (Einfügen) + Eingabemonitoring (Hotkey) + Mikrofon. Nach einem Bundle-Rebuild kleben alte Grants an der alten Signatur — dann:
+**LocalFlow** braucht: Bedienungshilfen (Einfügen) + Eingabemonitoring (Hotkey) + Mikrofon. Nach einem Bundle-Rebuild kleben alte Grants an der alten Signatur. Dann:
 
 ```bash
 tccutil reset Accessibility com.giu.localflow
@@ -53,7 +73,7 @@ und in Systemeinstellungen → Datenschutz beide neu vergeben. Symptom für fehl
 `config.json` im Projektordner:
 
 - `key_mode`: `"toggle"` (Default) oder `"hold"`.
-- `cleanup`: `false` (Default) — `true` schaltet LLM-Cleanup zu (~5-10s extra).
+- `cleanup`: `false` (Default), `true` schaltet LLM-Cleanup zu (~5-10s extra).
 - `stt_engine`: `"parakeet"` (Default) oder `"whisper"` (whisper.cpp-Fallback, Modelle in `models/`).
 - `language`: `"auto"` / `"de"` / `"nl"` / `"en"`.
 
